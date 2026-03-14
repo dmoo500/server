@@ -947,7 +947,12 @@ class PlayerQueuesController(CoreController):
                     self.play_index(queue_id, idx),
                     task_id=f"queue_play_index_{queue_id}",
                 )
+<<<<<<< HEAD
 >>>>>>> 594c0b83 (Apple Music radio stations and improved URL import support)
+=======
+            else:
+                self._transitioning_players.discard(queue_id)
+>>>>>>> a0e6bfb2 (Address Copilot review: fix error handling, transitioning_players leak, add URI tests)
             return
 
         # immediately update current item so UI shows the new track right away
