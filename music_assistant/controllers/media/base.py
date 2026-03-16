@@ -348,6 +348,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         if item_id.startswith(("http://", "https://")):
             with suppress(InvalidProviderURI):
 <<<<<<< HEAD
+<<<<<<< HEAD
                 resolved_media_type, provider_instance_id_or_domain, item_id = await parse_uri(
                     item_id
                 )
@@ -359,6 +360,18 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 =======
                 _, provider_instance_id_or_domain, item_id = await parse_uri(item_id)
 >>>>>>> dadd0eab (Restore minimal base.py URL parsing: resolve share URLs to provider+item_id in get())
+=======
+                parsed_media_type, provider_instance_id_or_domain, item_id = await parse_uri(
+                    item_id
+                )
+                if parsed_media_type != self.media_type:
+                    return cast(
+                        "ItemCls",
+                        await self.mass.music.get_item(
+                            parsed_media_type, item_id, provider_instance_id_or_domain
+                        ),
+                    )
+>>>>>>> 61040dae (Address Copilot review: track URL parsing, JSON decode error, media type delegation)
         # always prefer the full library item if we have it
         if library_item := await self.get_library_item_by_prov_id(
             item_id,
