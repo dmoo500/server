@@ -344,11 +344,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         """
 =======
         """Return (full) details for a single media item."""
-        # if item_id is a URL, resolve the actual provider and item_id via parse_uri
-        original_url: str | None = None
+        # if item_id is a provider share URL, resolve the actual provider and item_id
         if item_id.startswith(("http://", "https://")):
-            original_url = item_id
             with suppress(InvalidProviderURI):
+<<<<<<< HEAD
                 resolved_media_type, provider_instance_id_or_domain, item_id = await parse_uri(
                     item_id
                 )
@@ -357,6 +356,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                     ctrl = self.mass.music.get_controller(resolved_media_type)
                     return cast("ItemCls", await ctrl.get(item_id, provider_instance_id_or_domain))
 >>>>>>> 594c0b83 (Apple Music radio stations and improved URL import support)
+=======
+                _, provider_instance_id_or_domain, item_id = await parse_uri(item_id)
+>>>>>>> dadd0eab (Restore minimal base.py URL parsing: resolve share URLs to provider+item_id in get())
         # always prefer the full library item if we have it
         if library_item := await self.get_library_item_by_prov_id(
             item_id,
@@ -369,19 +371,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 self.mass.metadata.schedule_update_metadata(library_item)
             return library_item
         # grab full details from the provider
-        item = await self.get_provider_item(
+        return await self.get_provider_item(
             item_id,
             provider_instance_id_or_domain,
         )
-        # If the provider returned a fallback name (name equals the item id), try to derive
-        # a human-readable name from the URL slug (second-to-last path segment).
-        if original_url and item.name == item_id:
-            parts = original_url.rstrip("/").split("/")
-            if len(parts) >= 2:
-                slug = parts[-2].split("?")[0]
-                if slug and slug != item_id and "-" in slug:
-                    item.name = slug.replace("-", " ").title()
-        return item
 
     async def search(
         self,
