@@ -159,9 +159,19 @@ class MusicAssistant:
         )
         # IPv6 requires InterfaceChoice.All, so only enable when zeroconf_interfaces is "all"
         use_all_interfaces = zeroconf_interfaces == "all"
+        if use_all_interfaces:
+            zc_interfaces: list[str] | InterfaceChoice = InterfaceChoice.All
+            zc_ip_version = IPVersion.All
+        elif zeroconf_interfaces and zeroconf_interfaces != "default":
+            # specific IP address(es) provided - pass as list to bind only to that interface
+            zc_interfaces = [x.strip() for x in zeroconf_interfaces.split(",") if x.strip()]
+            zc_ip_version = IPVersion.V4Only
+        else:
+            zc_interfaces = InterfaceChoice.Default
+            zc_ip_version = IPVersion.V4Only
         self.aiozc = AsyncZeroconf(
-            ip_version=IPVersion.All if use_all_interfaces else IPVersion.V4Only,
-            interfaces=InterfaceChoice.All if use_all_interfaces else InterfaceChoice.Default,
+            ip_version=zc_ip_version,
+            interfaces=zc_interfaces,
         )
         # load all available providers from manifest files
         await self.__load_provider_manifests()

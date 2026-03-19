@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import PlaybackState
@@ -36,10 +37,27 @@ class RaopStream(AirPlayProtocol):
 
     async def start(self, start_ntp: int) -> None:
         """Start CLIRaop process."""
-        assert self.player.raop_discovery_info is not None  # for type checker
+        if self.player.raop_discovery_info is None:
+            raise RuntimeError(f"RAOP service not discovered for {self.player.display_name}")
         cli_binary = await get_cli_binary(self.player.protocol)
         extra_args: list[str] = []
-        extra_args += ["-if", self.mass.streams.bind_ip]
+        # Use publish_ip for -if when it's actually a local interface, so that
+        # cliraop advertises the correct external IP in SDP and the Apple TV can
+        # route UDP timing/control packets back to us.
+        # Falls back to bind_ip when publish_ip is not a local interface (e.g.
+        # when running inside Docker/OrbStack where the host IP is not bindable).
+        publish_ip = str(self.mass.streams.publish_ip or "")
+        if_ip = str(self.mass.streams.bind_ip)
+        if publish_ip:
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                _s.bind((publish_ip, 0))
+                if_ip = publish_ip
+            except OSError:
+                pass  # publish_ip is not a local interface, keep bind_ip
+            finally:
+                _s.close()
+        extra_args += ["-if", if_ip]
         if self.player.config.get_value(CONF_ENCRYPTION, True):
             extra_args += ["-encrypt"]
         if self.player.config.get_value(CONF_ALAC_ENCODE, True):
