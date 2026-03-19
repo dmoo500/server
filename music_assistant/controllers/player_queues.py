@@ -770,6 +770,8 @@ class PlayerQueuesController(CoreController):
         queue.radio_source = []
         if queue.state != PlaybackState.IDLE and not skip_stop:
             self.mass.create_task(self.stop(queue_id))
+        self.mass.cancel_timer(f"queue_play_index_{queue_id}")
+        self._transitioning_players.discard(queue_id)
         queue.current_index = None
         queue.current_item = None
         queue.elapsed_time = 0
@@ -811,6 +813,7 @@ class PlayerQueuesController(CoreController):
         """
         # cancel any pending play_index calls for this queue to prevent conflicts
         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
+        self._transitioning_players.discard(queue_id)
         queue_player = self.mass.players.get_player(queue_id, True)
         if queue_player is None:
             raise PlayerUnavailableError(f"Player {queue_id} is not available")
@@ -854,6 +857,7 @@ class PlayerQueuesController(CoreController):
         """
         # cancel any pending play_index calls for this queue to prevent conflicts
         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
+        self._transitioning_players.discard(queue_id)
         if not (queue := self._queues.get(queue_id)):
             return
         queue_active = queue.active
@@ -920,6 +924,18 @@ class PlayerQueuesController(CoreController):
             return
         next_index = self._get_next_index(queue_id, idx, True)
         if next_index is None:
+            # For RADIO items there's no next index, but we can skip to the next
+            # station track by re-playing the same index (provider fetches a new track).
+            current_item = self.get_item(queue_id, idx)
+            if current_item is not None and current_item.media_type == MediaType.RADIO:
+                current_item.streamdetails = None
+                self.mass.call_later(
+                    1,
+                    self.play_index(queue_id, idx),
+                    task_id=f"queue_play_index_{queue_id}",
+                )
+            else:
+                self._transitioning_players.discard(queue_id)
             return
 
         # immediately update current item so UI shows the new track right away
@@ -1357,6 +1373,16 @@ class PlayerQueuesController(CoreController):
         while True:
             next_index = self._get_next_index(queue_id, cur_index + idx)
             if next_index is None:
+                # For RADIO type items, treat them as a continuous source: clear the
+                # cached stream details and re-request the next track from the provider.
+                cur_item = self.get_item(queue_id, cur_index)
+                if cur_item is not None and cur_item.media_type == MediaType.RADIO:
+                    cur_item.streamdetails = None
+                    try:
+                        await self._load_item(cur_item, None)
+                    except (MediaNotFoundError, AudioError) as err:
+                        raise QueueEmpty("No more tracks available from radio station.") from err
+                    return cur_item
                 raise QueueEmpty("No more tracks left in the queue.")
             queue_item = self.get_item(queue_id, next_index)
             if queue_item is None:
@@ -1711,6 +1737,17 @@ class PlayerQueuesController(CoreController):
             media.album = (
                 album.name if (album := getattr(queue_item.media_item, "album", None)) else ""
             )
+            # For track-based radio stations (e.g. Apple Music Artist Radio)
+            # stream_metadata carries the currently playing track's artist/title.
+            if (
+                queue_item.media_type == MediaType.RADIO
+                and queue_item.streamdetails
+                and (sm := queue_item.streamdetails.stream_metadata)
+            ):
+                if sm.title:
+                    media.title = sm.title
+                if sm.artist:
+                    media.artist = sm.artist
             if queue_item.image:
                 # the image format needs to be 500x500 jpeg for maximum compatibility with players
                 # we prefer the imageproxy on the streamserver here because this request is sent
@@ -2678,6 +2715,10 @@ class PlayerQueuesController(CoreController):
         if prev_state["current_item_id"] is None:
             return
 
+        # retrieve prev_item here so it's available in the _clear_or_resume_delayed closure
+        # regardless of which code path (flow mode or non-flow mode) creates the task
+        prev_item = prev_state["current_item"]
+
         async def _clear_or_resume_delayed() -> None:
             for _ in range(5):
                 await asyncio.sleep(1)
@@ -2698,6 +2739,16 @@ class PlayerQueuesController(CoreController):
                         )
                         await self.play_index(queue.queue_id, next_index)
                     return
+            # If the last item was a radio station, continue playing instead of clearing.
+            # For track-based radio (Apple Music Artist Radio etc.) this fetches the next
+            # track from the station; for live radio it would reconnect to the stream.
+            if prev_item and prev_item.media_type == MediaType.RADIO:
+                current_index = self.index_by_id(queue.queue_id, prev_item.queue_item_id)
+                if current_index is not None and queue.state == PlaybackState.IDLE and queue.active:
+                    # clear cached stream details so the provider fetches a fresh track
+                    prev_item.streamdetails = None
+                    await self.play_index(queue.queue_id, current_index)
+                    return
             self.logger.info("End of queue reached, clearing items")
             self.clear(queue.queue_id)
 
@@ -2714,7 +2765,6 @@ class PlayerQueuesController(CoreController):
             return
 
         # For non-flow mode, use prev_state values since queue state may have been updated/reset
-        prev_item = prev_state["current_item"]
         if prev_item and (streamdetails := prev_item.streamdetails):
             duration = streamdetails.duration or prev_item.duration or 24 * 3600
         elif prev_item:
