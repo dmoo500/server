@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from music_assistant_models.enums import PlaybackState
@@ -60,6 +62,10 @@ class AirPlayProtocol(ABC):
         self._connected = asyncio.Event()
         self._metadata_checksum = ""
         self._last_metadata_sent: float = 0.0
+        self._progress_task: asyncio.Task[None] | None = None
+        self._artwork_tmpfile: str | None = None
+        self._artwork_url: str | None = None  # last image_url for which artwork was prepared
+        self._force_artwork_refresh: bool = False  # trigger two-step SENDMETA on next retry
 
     @property
     def running(self) -> bool:
@@ -84,7 +90,13 @@ class AirPlayProtocol(ABC):
         self.mass.call_later(2, self.send_cli_command(f"VOLUME={self.player.volume_level}"))
         # we also need to send the metadata after connection, because some players (e.g. Sonos)
         # simply won't start playback until they receive the metadata ?!
+        # Schedule multiple sends to handle Apple TV state transitions after other apps were used:
+        # the ATV may ignore the first SENDMETA while releasing a previous app's Now Playing lock.
         self.mass.call_later(2, self.player._on_player_media_updated)
+        self.mass.call_later(7, self._retry_metadata)
+        self.mass.call_later(15, self._retry_metadata)
+        # start periodic progress updates for Now Playing display on the device
+        self._progress_task = self.mass.create_task(self._progress_updater())
 
     async def stop(self, force: bool = False) -> None:
         """
@@ -92,10 +104,17 @@ class AirPlayProtocol(ABC):
 
         :param force: If True, immediately kill the process without graceful shutdown.
         """
+        # cancel the periodic progress update task
+        if self._progress_task and not self._progress_task.done():
+            self._progress_task.cancel()
         # always send stop command first
         await self.send_cli_command("ACTION=STOP")
         self._stopped = True
         await self.commands_pipe.remove()
+        # clean up artwork temp file if one was created
+        if self._artwork_tmpfile and os.path.exists(self._artwork_tmpfile):
+            Path(self._artwork_tmpfile).unlink()
+            self._artwork_tmpfile = None
         if force:
             # Kill immediately - skip write_eof() as it can block indefinitely
             # when the CLI stops reading from stdin after receiving STOP.
@@ -134,6 +153,60 @@ class AirPlayProtocol(ABC):
             command += "\n"
         await self.commands_pipe.write(command.encode("utf-8"))
 
+    def _retry_metadata(self) -> None:
+        """Force a metadata re-send by clearing the checksum cache and triggering an update."""
+        if self._stopped:
+            return
+        self.logger.debug(
+            "%s: Triggering metadata refresh (Now Playing update)", self.player.display_name
+        )
+        # Reset checksum so send_metadata does not skip the resend as duplicate.
+        # Also set _force_artwork_refresh so send_metadata will first send a SENDMETA
+        # without artwork (clearing the ATV's cached artwork), then immediately resend
+        # with artwork — forcing the ATV to re-fetch even if the picohttp URL is the same.
+        self._metadata_checksum = ""
+        self._artwork_url = None
+        self._force_artwork_refresh = True
+        self.player._on_player_media_updated()
+
+    async def _progress_updater(self) -> None:
+        """Periodically send progress and metadata updates to the player for Now Playing display."""
+        await asyncio.sleep(5)
+        ticks = 0
+        while not self._stopped:
+            if ticks % 6 == 0:
+                # Every 30 seconds force a full metadata re-send (incl. artwork) to
+                # recover from state changes: screensaver, app switches on Apple TV.
+                # This runs regardless of playback state so it also fires after
+                # the ATV returns from screensaver or another app.
+                self._retry_metadata()
+            elif self.player.playback_state == PlaybackState.PLAYING:
+                media = self.player.state.current_media
+                if media:
+                    progress = int(media.corrected_elapsed_time or 0)
+                    await self.send_cli_command(f"PROGRESS={progress}")
+            await asyncio.sleep(5)
+            ticks += 1
+
+    async def _prepare_artwork(self, image_url: str) -> str:
+        """Return the value for the CLI ARTWORK= command.
+
+        Default implementation rewrites MA-internal imageproxy URLs to use a
+        loopback HTTP address so cliap2 can always reach the local endpoint,
+        regardless of whether MA is behind an HTTPS reverse proxy or
+        publish_ip is 0.0.0.0. External CDN URLs are passed through unchanged.
+        RaopStream overrides this to download the image directly to a temp file.
+
+        :param image_url: The original image URL from PlayerMedia.
+        """
+        if "/imageproxy?" in image_url:
+            # Rewrite MA-internal imageproxy URL to guaranteed loopback HTTP
+            local_base = f"http://127.0.0.1:{self.mass.streams.publish_port}"
+            for ma_base in (self.mass.streams.base_url, self.mass.webserver.base_url):
+                if image_url.startswith(ma_base):
+                    return local_base + image_url[len(ma_base) :]
+        return image_url
+
     async def send_metadata(self, progress: int | None, metadata: PlayerMedia | None) -> None:
         """Send metadata to player."""
         if self._stopped:
@@ -154,12 +227,49 @@ class AirPlayProtocol(ABC):
             self._metadata_checksum = metadata_checksum
             self._last_metadata_sent = time.time()
 
+            # Build the complete SENDMETA command in one block.
+            # ARTWORK must appear before ACTION=SENDMETA so the binary has the
+            # image URL ready when it processes the send action.
             cmd = f"TITLE={title}\nARTIST={artist}\nALBUM={album}\n"
-            cmd += f"DURATION={duration}\nPROGRESS=0\nACTION=SENDMETA\n"
+            cmd += f"DURATION={duration}\n"
+            if metadata.image_url:
+                artwork_value = await self._prepare_artwork(metadata.image_url)
+                self.logger.debug(
+                    "%s: Sending metadata — title=%r artist=%r album=%r artwork=%s",
+                    self.player.display_name,
+                    title,
+                    artist,
+                    album,
+                    artwork_value,
+                )
+                if self._force_artwork_refresh:
+                    # Two-step SENDMETA: first without artwork to clear the ATV's cached
+                    # artwork entry, then immediately with artwork to force a re-fetch.
+                    # This is necessary because the ATV caches artwork by picohttp URL;
+                    # sending the same URL again after a screensaver/app-switch is ignored.
+                    self._force_artwork_refresh = False
+                    clear_cmd = (
+                        f"TITLE={title}\n"
+                        f"ARTIST={artist}\n"
+                        f"ALBUM={album}\n"
+                        f"DURATION={duration}\n"
+                        "PROGRESS=0\n"
+                        "ACTION=SENDMETA\n"
+                    )
+                    await self.send_cli_command(clear_cmd)
+                    await asyncio.sleep(0.5)
+                cmd += f"ARTWORK={artwork_value}\n"
+            else:
+                self.logger.debug(
+                    "%s: Sending metadata — title=%r artist=%r album=%r (no artwork)",
+                    self.player.display_name,
+                    title,
+                    artist,
+                    album,
+                )
+                self._force_artwork_refresh = False
+            cmd += "PROGRESS=0\nACTION=SENDMETA\n"
 
             await self.send_cli_command(cmd)
-            # get image
-            if metadata.image_url:
-                await self.send_cli_command(f"ARTWORK={metadata.image_url}")
         if progress is not None:
             await self.send_cli_command(f"PROGRESS={progress}")
