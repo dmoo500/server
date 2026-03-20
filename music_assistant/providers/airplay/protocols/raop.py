@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import tempfile
+from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -112,9 +113,17 @@ class RaopStream(AirPlayProtocol):
         # 3. Fall back to bind_ip as a last resort.
         target_ip = str(self.player.device_info.ip_address)
         if_ip = str(self.mass.streams.bind_ip)
-        _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            _s.connect((target_ip, 80))
+            is_ipv6_target = ip_address(target_ip).version == 6
+        except ValueError:
+            is_ipv6_target = False
+        route_family = socket.AF_INET6 if is_ipv6_target else socket.AF_INET
+        route_target: tuple[str, int] | tuple[str, int, int, int] = (
+            (target_ip, 80, 0, 0) if is_ipv6_target else (target_ip, 80)
+        )
+        _s = socket.socket(route_family, socket.SOCK_DGRAM)
+        try:
+            _s.connect(route_target)
             routed_ip = _s.getsockname()[0]
             if routed_ip and routed_ip not in ("0.0.0.0", ""):
                 if_ip = routed_ip
@@ -127,9 +136,17 @@ class RaopStream(AirPlayProtocol):
             # (Docker/OrbStack scenario where the host IP should be advertised)
             publish_ip = str(self.mass.streams.publish_ip or "")
             if publish_ip:
-                _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 try:
-                    _s.bind((publish_ip, 0))
+                    publish_is_ipv6 = ip_address(publish_ip).version == 6
+                except ValueError:
+                    publish_is_ipv6 = False
+                publish_family = socket.AF_INET6 if publish_is_ipv6 else socket.AF_INET
+                bind_target: tuple[str, int] | tuple[str, int, int, int] = (
+                    (publish_ip, 0, 0, 0) if publish_is_ipv6 else (publish_ip, 0)
+                )
+                _s = socket.socket(publish_family, socket.SOCK_DGRAM)
+                try:
+                    _s.bind(bind_target)
                     if_ip = publish_ip
                 except OSError:
                     pass

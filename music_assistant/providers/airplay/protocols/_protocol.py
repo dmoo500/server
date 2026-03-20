@@ -227,11 +227,14 @@ class AirPlayProtocol(ABC):
             self._metadata_checksum = metadata_checksum
             self._last_metadata_sent = time.time()
 
-            # Build the complete SENDMETA command in one block.
-            # ARTWORK must appear before ACTION=SENDMETA so the binary has the
-            # image URL ready when it processes the send action.
-            cmd = f"TITLE={title}\nARTIST={artist}\nALBUM={album}\n"
-            cmd += f"DURATION={duration}\n"
+            # Send metadata fields as separate pipe writes to avoid truncation on
+            # non-blocking FIFO writes when payloads become large.
+            async def _send_base_metadata_fields() -> None:
+                await self.send_cli_command(f"TITLE={title}")
+                await self.send_cli_command(f"ARTIST={artist}")
+                await self.send_cli_command(f"ALBUM={album}")
+                await self.send_cli_command(f"DURATION={duration}")
+
             if metadata.image_url:
                 artwork_value = await self._prepare_artwork(metadata.image_url)
                 self.logger.debug(
@@ -248,17 +251,12 @@ class AirPlayProtocol(ABC):
                     # This is necessary because the ATV caches artwork by picohttp URL;
                     # sending the same URL again after a screensaver/app-switch is ignored.
                     self._force_artwork_refresh = False
-                    clear_cmd = (
-                        f"TITLE={title}\n"
-                        f"ARTIST={artist}\n"
-                        f"ALBUM={album}\n"
-                        f"DURATION={duration}\n"
-                        "PROGRESS=0\n"
-                        "ACTION=SENDMETA\n"
-                    )
-                    await self.send_cli_command(clear_cmd)
+                    await _send_base_metadata_fields()
+                    await self.send_cli_command("PROGRESS=0")
+                    await self.send_cli_command("ACTION=SENDMETA")
                     await asyncio.sleep(0.5)
-                cmd += f"ARTWORK={artwork_value}\n"
+                await _send_base_metadata_fields()
+                await self.send_cli_command(f"ARTWORK={artwork_value}")
             else:
                 self.logger.debug(
                     "%s: Sending metadata — title=%r artist=%r album=%r (no artwork)",
@@ -268,8 +266,9 @@ class AirPlayProtocol(ABC):
                     album,
                 )
                 self._force_artwork_refresh = False
-            cmd += "PROGRESS=0\nACTION=SENDMETA\n"
+                await _send_base_metadata_fields()
 
-            await self.send_cli_command(cmd)
+            await self.send_cli_command("PROGRESS=0")
+            await self.send_cli_command("ACTION=SENDMETA")
         if progress is not None:
             await self.send_cli_command(f"PROGRESS={progress}")
