@@ -165,7 +165,6 @@ class AirPlayProtocol(ABC):
         # without artwork (clearing the ATV's cached artwork), then immediately resend
         # with artwork — forcing the ATV to re-fetch even if the picohttp URL is the same.
         self._metadata_checksum = ""
-        self._artwork_url = None
         self._force_artwork_refresh = True
         self.player._on_player_media_updated()
 

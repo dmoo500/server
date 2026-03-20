@@ -332,16 +332,21 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         # if item_id is a provider share URL, resolve the actual provider and item_id
         if item_id.startswith(("http://", "https://")):
             with suppress(InvalidProviderURI):
-                parsed_media_type, provider_instance_id_or_domain, item_id = await parse_uri(
-                    item_id
-                )
-                if parsed_media_type != self.media_type:
-                    return cast(
-                        "ItemCls",
-                        await self.mass.music.get_item(
-                            parsed_media_type, item_id, provider_instance_id_or_domain
-                        ),
-                    )
+                parsed_media_type, parsed_provider, parsed_item_id = await parse_uri(item_id)
+                # Only treat as provider share URL when parse_uri returns a
+                # concrete media type for a non-builtin provider.
+                if parsed_media_type != MediaType.UNKNOWN and parsed_provider != "builtin":
+                    if parsed_media_type != self.media_type:
+                        return cast(
+                            "ItemCls",
+                            await self.mass.music.get_item(
+                                parsed_media_type,
+                                parsed_item_id,
+                                parsed_provider,
+                            ),
+                        )
+                    provider_instance_id_or_domain = parsed_provider
+                    item_id = parsed_item_id
         # always prefer the full library item if we have it
         if library_item := await self.get_library_item_by_prov_id(
             item_id,

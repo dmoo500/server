@@ -21,15 +21,12 @@ from music_assistant_models.errors import MusicAssistantError, SetupFailedError
 from music_assistant_models.event import MassEvent
 from music_assistant_models.helpers import set_global_cache_values
 from music_assistant_models.provider import ProviderManifest
-from zeroconf import InterfaceChoice, IPVersion
-from zeroconf.asyncio import AsyncZeroconf
 
 from music_assistant.constants import (
     API_SCHEMA_VERSION,
     CONF_DEFAULT_PROVIDERS_SETUP,
     CONF_PROVIDERS,
     CONF_SERVER_ID,
-    CONF_ZEROCONF_INTERFACES,
     CONFIGURABLE_CORE_CONTROLLERS,
     DEFAULT_PROVIDERS,
     MASS_LOGGER_NAME,
@@ -147,15 +144,6 @@ class MusicAssistant:
         # setup config controller first and fetch important config values
         self.config = ConfigController(self)
         await self.config.setup()
-        # create shared zeroconf instance
-        zeroconf_interfaces = self.config.get_raw_core_config_value(
-            "players", CONF_ZEROCONF_INTERFACES, "default"
-        )
-        zc_interfaces, zc_ip_version = self._get_zeroconf_config(zeroconf_interfaces)
-        self.aiozc = AsyncZeroconf(
-            ip_version=zc_ip_version,
-            interfaces=zc_interfaces,
-        )
         self.discovery = DiscoveryController(self)
         # load all available providers from manifest files
         await self.__load_provider_manifests()
@@ -222,20 +210,6 @@ class MusicAssistant:
         # at this point we are fully up and running,
         # set state to running to signal we're ready
         self._set_state(CoreState.RUNNING)
-
-    @staticmethod
-    def _get_zeroconf_config(
-        zeroconf_interfaces: str,
-    ) -> tuple[list[str] | InterfaceChoice, IPVersion]:
-        """Parse zeroconf interface setting into AsyncZeroconf config."""
-        # IPv6 requires InterfaceChoice.All, so only enable when configured explicitly.
-        if zeroconf_interfaces == "all":
-            return InterfaceChoice.All, IPVersion.All
-        if zeroconf_interfaces and zeroconf_interfaces != "default":
-            # specific IP address(es) provided - bind only to those interfaces
-            interfaces = [x.strip() for x in zeroconf_interfaces.split(",") if x.strip()]
-            return interfaces, IPVersion.V4Only
-        return InterfaceChoice.Default, IPVersion.V4Only
 
     async def stop(self) -> None:
         """Stop running the music assistant server."""
