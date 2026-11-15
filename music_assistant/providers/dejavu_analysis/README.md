@@ -1,0 +1,117 @@
+# Dejavu analysis: local development
+
+This experimental provider installs `music-assistant-fingerprint` from an exact
+revision of [dmoo500/audio-fingerprint](https://github.com/dmoo500/audio-fingerprint).
+There is no PyPI release. The [receiver](https://github.com/dmoo500/audio-fingerprint-server)
+is an independent experiment, not an official Music Assistant or OHF service.
+For this worktree, install it into an isolated, git-ignored directory without changing
+the shared MA virtual environment (the MA environment already supplies NumPy/SciPy/soxr):
+
+```sh
+uv pip install --reinstall --no-deps --target .venv-fingerprint ../music-assistant-fingerprint
+export PYTHONPATH="$PWD/.venv-fingerprint"
+```
+
+Use MA's existing development Python with that `PYTHONPATH`. The installed package metadata
+lets the normal provider loader satisfy the exact manifest pin without contacting PyPI.
+Repeat the local installation after changing the shared library.
+
+The manifest pin is a local-development placeholder, not a published dependency. Do not submit
+this provider upstream until the package has a release and its compatibility has been verified.
+
+The provider analyzes the PCM already decoded for normal playback, including streaming tracks.
+It does not fetch additional audio, write decoded audio to disk, or expand background scanning
+beyond the existing filesystem-only scope. Only finite tracks starting at zero are accepted.
+Version 2 processes the whole decoded track using overlapping windows of at most 30 seconds,
+with a hop-aligned stride of approximately 20 seconds, for tracks of at most 30 minutes.
+The rolling PCM buffer is bounded; decoded audio is never stored. Window overlap supplies
+landmark context around section boundaries. End-of-stream duration may differ from declared
+duration by at most one second for rounded metadata; larger mismatches fail rather than
+publishing partial coverage. The actual PCM duration is recorded.
+
+Local results use the existing audio-analysis storage. Sharing is off by default. When enabled,
+only fingerprints, sampled coverage and available title/artist/album/recording identifiers are
+sent. No file paths, source URLs, provider IDs or API keys enter the payload. Library metadata
+is read locally; external tracks without library metadata may lack identification information.
+
+Consent is recorded for the destination used when analysis starts. Enabling sharing later
+does not backfill old private results. Changing destinations does not redirect pending uploads.
+Analysis must complete through MA's normal finalization; cancellation never uploads.
+
+Extraction, result construction and serialization use MA's existing low-priority analysis
+workers, concurrency permits and playback-active solo lock. Controller timeouts can cancel
+overloaded analysis; playback takes priority and no incomplete reference is published.
+Full coverage still uses CPU, RAM and storage: it cannot be free of performance cost.
+Per-track results are capped at 1,000,000 landmarks and 36,000,000 serialized bytes.
+Tracks exceeding those limits fail explicitly rather than silently omitting passages.
+
+The provider's analysis version is now 2: existing v1 analyses are eligible for reanalysis
+on the next normal complete playback or existing filesystem-only background scan.
+No streaming audio is fetched just to backfill fingerprints, and existing analyses are not
+deleted ahead of successful replacement. Old pending v1 uploads remain recoverable.
+Upgrade the fingerprint receiver before activating this provider: v2 uploads require the
+new coverage validation and size limits. Existing v1 server references are retained.
+
+## Local server contract
+
+The new experimental [fingerprint server](https://github.com/dmoo500/audio-fingerprint-server)
+implements this endpoint locally. The older general analysis server is unchanged:
+
+`POST /api/v1/dejavu/submissions`
+
+- `X-API-Key`: upload authentication (personal key with upload permission in gateway mode).
+- `X-Application-Key`: additional application authentication when a fingerprint application
+  token is supplied. This is never a local Music Assistant login token.
+- `Idempotency-Key`: SHA-256 of the canonical JSON request body.
+- Body: `format_id`, `sample_rate`, `offset_unit`, `windows`, `fingerprints`, `metadata`.
+- Offsets are integer 2,048-sample FFT hops at 44,100 Hz relative to the track.
+- `format_id` identifies the shared algorithm and its fixed parameters.
+- New full-track documents use `ma-dejavu-landmarks-v2`; the receiver also accepts
+  legacy sampled v1 documents. Landmark extraction parameters remain unchanged.
+- The server must validate and durably stage a submission before returning HTTP 202:
+  `{"submission_id": "<idempotency key>", "status": "queued"}`.
+- Duplicate submissions must return the same ID and `queued` or `processed`.
+- The server must not expose unvalidated submissions to recognition queries.
+
+Persisted analysis is the upload recovery source, with destination/payload-scoped acknowledgements
+and retry timing in MA's cache. One serialized upload path prevents competing local deliveries.
+Recovery scans once at startup and is scheduled again only when deliveries are pending.
+Requests are serialized and spaced at least one second apart. Timeouts, HTTP 429 and 5xx
+defer all submissions; other statuses block uploads until the provider is reloaded.
+Numeric or HTTP-date Retry-After is respected up to one day. A cache clear can cause
+resubmission, so server idempotency is required. Deleting local analysis also deletes its
+recoverable pending upload.
+
+The ingestion worker, recognition API and microphone test page live in the separate fingerprint
+server project, not in this MA provider.
+
+The shared library's 0.2.2 update reduces temporary FFT/filter allocations without
+changing the v2 fingerprints or coverage. FFTs run in batches and peak filtering
+uses overlapping halos, retaining float64 precision and the same neighborhoods.
+The full spectrogram is never retained; batches are discarded after their peaks
+have been extracted.
+Existing analysis and receiver data remain compatible; no version-triggered
+reanalysis or database migration is required for this optimization.
+
+## Application credentials
+
+Like Apple Music, this provider uses MA's shared `app_var()` resolver for its application
+credential, with an optional secure provider override. The personal **Upload API key**
+remains separate. **Application token override**, if filled, takes precedence; otherwise
+the provider resolves `dejavu_application_key` through `app_var()`. If neither supplies a
+token, the application header is omitted and legacy authentication stays unchanged.
+Normal delivery and recovered uploads use the same credential resolution.
+
+For this independent pilot there is no official bundled application key. Supply your own
+token locally via `MASS_APP_VAR_DEJAVU_APPLICATION_KEY`, or for unbundled source builds
+via the existing `MASS_APP_VARS_FILE` / `~/.musicassistant/app_vars.json` mechanism.
+Do not overwrite other app variables when adding your entry. The token is sent to the
+configured recognition server: supply only a credential intended for that destination.
+Adding a future official bundled key requires maintainer approval and a trusted
+destination policy; this change does not modify MA's canonical bundle registry.
+Tokens are never included in fingerprint payloads, cache identifiers or logs.
+
+The new override field is optional and the existing `api_key` field is unchanged, so
+existing provider data needs no migration. Saving provider settings reloads the provider.
+There is no submission-status polling: a valid durable `queued` acknowledgement marks
+delivery, not completed processing. No additional requests are made after acceptance.

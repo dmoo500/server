@@ -359,15 +359,25 @@ async def rss_checkpoint_mb(server: ServerHandle, control: ControlClient) -> flo
     return round(server.ps.memory_info().rss / 1024 / 1024, 1)
 
 
-def start_server(data_dir: Path, *, yappi_boot: bool = False) -> ServerHandle:
+def start_server(
+    data_dir: Path,
+    *,
+    yappi_boot: bool = False,
+    fingerprint_fixture: bool = False,
+    allocation_profile: Path | None = None,
+) -> ServerHandle:
     """
     Spawn the hermetic perf server and wait until it is ready.
 
     :param data_dir: The (isolated) data directory for this server instance.
     :param yappi_boot: Start yappi before the music_assistant import for boot profiling.
+    :param fingerprint_fixture: Use local non-silent tracks for fingerprint streaming comparisons.
+    :param allocation_profile: Optional Memray native-allocation output; affects timings.
     """
     port, control_port, stream_port = _free_ports()
     env = os.environ.copy()
+    if fingerprint_fixture:
+        env.pop("PERF_YAPPI_BOOT", None)
     if yappi_boot:
         env["PERF_YAPPI_BOOT"] = "1"
     log_file = (data_dir / "server.log").open("a")
@@ -383,6 +393,8 @@ def start_server(data_dir: Path, *, yappi_boot: bool = False) -> ServerHandle:
             str(control_port),
             "--stream-port",
             str(stream_port),
+            *(["--fingerprint-fixture"] if fingerprint_fixture else []),
+            *(["--allocation-profile", str(allocation_profile)] if allocation_profile else []),
         ],
         stdout=subprocess.PIPE,
         stderr=log_file,
@@ -572,7 +584,12 @@ async def scenario_api_bench(
 
 
 async def start_flow_playback(
-    ws: PerfWsClient, control: ControlClient, player_ids: list[str], server: ServerHandle
+    ws: PerfWsClient,
+    control: ControlClient,
+    player_ids: list[str],
+    server: ServerHandle,
+    *,
+    disjoint_tracks: bool = False,
 ) -> list[str]:
     """
     Start flow-mode playback on the given players and return their stream URLs.
@@ -588,12 +605,22 @@ async def start_flow_playback(
     # allow the config change to be applied to the registered players
     await asyncio.sleep(1)
     # a few tracks so the flow stream comfortably outlasts the capture window
-    tracks = (await ws.command("music/tracks/library_items", {"limit": 3})).result
+    tracks = (
+        await ws.command(
+            "music/tracks/library_items",
+            {"limit": 3 * len(player_ids) if disjoint_tracks else 3},
+        )
+    ).result
     track_uris = [track["uri"] for track in tracks]
-    for player_id in player_ids:
+    if disjoint_tracks and len(track_uris) < 3 * len(player_ids):
+        raise BenchmarkError("Not enough distinct tracks for independent analysis streams")
+    for index, player_id in enumerate(player_ids):
         await ws.command(
             "player_queues/play_media",
-            {"queue_id": player_id, "media": track_uris},
+            {
+                "queue_id": player_id,
+                "media": track_uris[index * 3 : (index + 1) * 3] if disjoint_tracks else track_uris,
+            },
         )
     deadline = time.monotonic() + PLAYBACK_READY_TIMEOUT
     while time.monotonic() < deadline:
@@ -627,8 +654,8 @@ async def stop_playback(ws: PerfWsClient, player_ids: list[str]) -> None:
         await ws.command("players/cmd/stop", {"player_id": player_id})
 
 
-async def _consume_stream(url: str, duration: int) -> None:
-    """Consume a stream URL rate-limited to ~realtime for the given duration."""
+async def _consume_stream(url: str, duration: int) -> int:
+    """Consume a stream at approximately realtime and return downloaded bytes."""
     started = time.perf_counter()
     proc = await asyncio.create_subprocess_exec(
         "curl",
@@ -674,6 +701,7 @@ async def _consume_stream(url: str, duration: int) -> None:
             f"stream stalled (http={http_code}, downloaded {downloaded} bytes, "
             f"expected >={min_bytes}): {stderr.decode()[:300]}"
         )
+    return int(downloaded)
 
 
 async def scenario_streaming(

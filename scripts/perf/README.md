@@ -51,6 +51,55 @@ combined maximum of 2,000,000 rows. `--iterations` accepts 3–100 samples per
 mode. Use a few sizes first, then increase them to approximate the target
 installation; absolute timings are machine-specific.
 
+## Full-track fingerprint streaming comparison
+
+On a checkout containing the optional `dejavu_analysis` provider and its installed
+dependencies:
+
+```shell
+.venv/bin/python -m scripts.perf.fingerprint_streaming_benchmark \
+  --repeats 3 --seconds 80 --out fingerprint-streaming.json
+```
+
+This focused comparison reuses the hermetic server and streaming helpers. Each
+run starts a fresh temporary instance on private loopback ports; it never
+restarts the running server or reads its data. Uploads are disabled. Unlike the
+normal suite's silence, both arms use the same deterministic 60-second synthetic
+stereo WAV. Two demo players receive disjoint queues of three tracks each, so
+analysis cannot be deduplicated between players.
+
+The default is three alternating off/on pairs (about nine minutes). `--repeats 1`
+is a smoke test. The capture lasts 75–120 seconds; normal flow prebuffering may
+decode all three tracks per queue before the consumer has heard them. The
+enabled arm must persist version-2, gap-free, nonempty full-track results for
+**all six** distinct tracks. Missing, partial or outdated results fail the run,
+as does output below 90% of the target realtime byte rate. The baseline must
+produce no Dejavu results. Actual output-stream activity is observed without
+changing production analysis scheduling, timeouts or resource limits.
+
+The JSON contains each run, medians and absolute median deltas for Python CPU,
+ffmpeg CPU, peak RSS, event-loop lag and concurrent `players/all` API latency.
+Sampling starts before playback setup and ends before reading fingerprint
+documents for validation. RSS before playback includes provider imports;
+peak growth separates subsequent allocation from that starting footprint.
+Library setup/import CPU and network-upload cost are not included. Max loop lag
+is sampled every 100 ms, RSS every 200 ms, and API latency roughly every 250 ms;
+brief allocation/scheduling spikes can be missed.
+
+These are synthetic, machine-specific measurements, not a guarantee of zero
+impact or proof of uninterrupted playback on real hardware. Keep other machine
+load and power/thermal conditions comparable. CodSpeed's deterministic
+pure-function benchmarks cannot replace this async streaming comparison.
+
+For a **separate** native-allocation investigation, install the optional `memray`
+profiling tool and add `--allocation-profile-dir allocations --repeats 1`.
+Tracking starts after server boot and includes provider setup, playback and
+shutdown. Each arm writes an aggregated Memray capture; inspect it with
+`memray flamegraph allocations/0-on.bin` or `FileReader`'s high-watermark records.
+Native tracking significantly inflates CPU, RSS and latency; never mix these
+results with the uninstrumented performance comparison. The JSON explicitly
+marks profiled runs with `allocation_profiled: true`.
+
 ## What it measures
 
 The suite runs two passes: pass 1 executes every scenario **unprofiled** for

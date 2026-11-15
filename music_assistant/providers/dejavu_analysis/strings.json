@@ -1,0 +1,23 @@
+{
+  "manifest": {
+    "description": "Creates landmark fingerprints during playback for an opt-in song recognition service."
+  },
+  "config_entries": {
+    "upload_enabled": {
+      "label": "Share fingerprints",
+      "description": "Upload fingerprints and track identifiers to your configured recognition server. This reveals information about your music collection. No audio or source URLs are uploaded. Only analyses generated while sharing is enabled are eligible."
+    },
+    "upload_url": {
+      "label": "Recognition server URL",
+      "description": "Base URL of your recognition server. HTTPS is required except for localhost development. The server must implement the fingerprint submission contract."
+    },
+    "api_key": {
+      "label": "Upload API key",
+      "description": "Upload key for the legacy server, or your personal fingerprint key with upload permission when using the gateway."
+    },
+    "application_key": {
+      "label": "Application token override",
+      "description": "Optional fingerprint application token for your recognition server. Overrides the centrally supplied application token. Leave empty when it is supplied centrally, or for legacy servers without application authentication. Never use a local Music Assistant login token."
+    }
+  }
+}

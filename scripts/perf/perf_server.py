@@ -136,6 +136,8 @@ class ControlApi:
         app.router.add_get("/lag", self._handle_lag)
         app.router.add_post("/resolve_stream_url", self._handle_resolve_stream_url)
         app.router.add_post("/statistics/query_benchmark", self._handle_statistics_query_benchmark)
+        app.router.add_get("/fingerprints", self._handle_fingerprints)
+        app.router.add_post("/fingerprints/setup", self._handle_fingerprint_setup)
         app.router.add_post("/gc", self._handle_gc)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -169,7 +171,12 @@ class ControlApi:
         return web.json_response({"status": "ok"})
 
     async def _handle_lag(self, request: web.Request) -> web.Response:
-        return web.json_response({"max_lag_ms": round(self.lag_monitor.max_lag * 1000, 2)})
+        return web.json_response(
+            {
+                "max_lag_ms": round(self.lag_monitor.max_lag * 1000, 2),
+                "playback_active": self.mass.streams.audio_analysis.playback_active(),
+            }
+        )
 
     async def _handle_gc(self, request: web.Request) -> web.Response:
         collected = gc.collect()
@@ -192,6 +199,109 @@ class ControlApi:
             LOGGER.exception("Statistics query benchmark failed")
             raise web.HTTPInternalServerError(text=f"{type(err).__name__}: {err}") from err
         return web.json_response(result)
+
+    async def _handle_fingerprints(self, request: web.Request) -> web.Response:
+        from music_assistant.controllers.streams.audio_analysis_codec import (  # noqa: PLC0415
+            decode_extra_data,
+        )
+
+        controller = self.mass.streams.audio_analysis
+        results = []
+        async for row in controller.iter_audio_analysis_rows("dejavu_analysis"):
+            extra = await asyncio.to_thread(decode_extra_data, row["header"])
+            if extra is None:
+                raise web.HTTPInternalServerError(text="Invalid stored fingerprint document")
+            doc = extra["dejavu"]
+            end = 0
+            full = True
+            for window in doc.get("windows", []):
+                if window["start_sample"] > end:
+                    full = False
+                end = max(end, window["start_sample"] + window["sample_count"])
+            results.append(
+                {
+                    "format_id": doc.get("format_id"),
+                    "landmarks": len(doc.get("fingerprints", [])),
+                    "duration_seconds": doc.get("metadata", {}).get("duration"),
+                    "full": full and end == 60 * 44100,
+                    "analysis_version": row["analysis_version"],
+                    "item_id": row["item_id"],
+                }
+            )
+        return web.json_response(
+            {"results": results, "playback_active": controller.playback_active()}
+        )
+
+    async def _handle_fingerprint_setup(self, request: web.Request) -> web.Response:
+        """Configure only local benchmark providers with their final fixture sizes."""
+        body = await request.json()
+        await self.mass.config._create_provider_instance(
+            "test",
+            {
+                "num_artists": 1,
+                "num_albums": 1,
+                "num_tracks": 6,
+                "num_podcasts": 0,
+                "num_audiobooks": 0,
+            },
+        )
+        await self.mass.config._create_provider_instance(
+            "_demo_player_provider", {"number_of_players": 2}
+        )
+        if body["enabled"]:
+            await self.mass.config._create_provider_instance(
+                "dejavu_analysis", {"upload_enabled": False}
+            )
+        return web.json_response({"status": "configured"})
+
+
+def prepare_fingerprint_fixture(data_dir: Path) -> Path:
+    """Write a deterministic synthetic WAV exclusively in the temporary benchmark directory."""
+    import wave  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    target = data_dir / "fingerprint-fixture.wav"
+    rng = np.random.default_rng(20261114)
+    with wave.open(str(target), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(44100)
+        for _ in range(60):
+            mono = np.clip(rng.normal(0, 0.1, 44100), -1, 1)
+            pcm = np.repeat((mono * 32767).astype("<i2")[:, None], 2, axis=1)
+            output.writeframes(pcm.tobytes())
+    return target
+
+
+async def install_fingerprint_fixture(data_dir: Path) -> None:
+    """Replace only the hermetic test provider's silence source with the local fixture."""
+    from music_assistant_models.enums import ContentType, MediaType, StreamType  # noqa: PLC0415
+    from music_assistant_models.media_items import AudioFormat  # noqa: PLC0415
+    from music_assistant_models.streamdetails import StreamDetails  # noqa: PLC0415
+
+    from music_assistant.providers.test import TestProvider  # noqa: PLC0415
+
+    fixture = await asyncio.to_thread(prepare_fingerprint_fixture, data_dir)
+
+    async def local_stream_details(
+        self: TestProvider, item_id: str, media_type: MediaType
+    ) -> StreamDetails:
+        return StreamDetails(
+            provider=self.instance_id,
+            item_id=item_id,
+            audio_format=AudioFormat(
+                content_type=ContentType.WAV, sample_rate=44100, bit_depth=16, channels=2
+            ),
+            media_type=media_type,
+            stream_type=StreamType.LOCAL_FILE,
+            path=str(fixture),
+            duration=60,
+            can_seek=True,
+            allow_seek=True,
+        )
+
+    TestProvider.get_stream_details = local_stream_details  # type: ignore[method-assign]
 
 
 def _yappi_top_rows(limit: int = YAPPI_TOP_LIMIT) -> list[dict[str, Any]]:
@@ -245,6 +355,21 @@ def _create_mock_zeroconf() -> MagicMock:
     return mock_zc
 
 
+def allocation_tracking(path: Path | None) -> Any:
+    """Return an optional native-allocation tracker for an isolated profiling run."""
+    from contextlib import nullcontext  # noqa: PLC0415
+
+    if path is None:
+        return nullcontext()
+    import memray  # noqa: PLC0415
+
+    return memray.Tracker(
+        path,
+        native_traces=True,
+        file_format=memray.FileFormat.AGGREGATED_ALLOCATIONS,
+    )
+
+
 async def run(args: argparse.Namespace) -> None:
     """Boot the hermetic server and serve until SIGINT/SIGTERM."""
     # imported late so PERF_YAPPI_BOOT profiling can start before this import
@@ -257,6 +382,8 @@ async def run(args: argparse.Namespace) -> None:
     cache_dir = os.path.join(data_dir, ".cache")
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    if args.fingerprint_fixture:
+        await install_fingerprint_fixture(Path(data_dir))
 
     # force local-only webserver/streamserver binding before anything reads the config
     orig_cfg_setup = ConfigController.setup
@@ -339,22 +466,23 @@ async def run(args: argparse.Namespace) -> None:
     lag_monitor = LoopLagMonitor()
     mass.create_task(lag_monitor.run())
     control_api = ControlApi(mass, lag_monitor)
-    await control_api.start(args.control_port)
+    with allocation_tracking(args.allocation_profile):
+        await control_api.start(args.control_port)
 
-    print(
-        f"PERF_SERVER_READY pid={os.getpid()} port={args.port} "
-        f"control_port={args.control_port} stream_port={args.stream_port} "
-        f"startup_secs={startup_secs:.2f} "
-        f"rss_mb={psutil.Process().memory_info().rss / 1024 / 1024:.1f}",
-        flush=True,
-    )
+        print(
+            f"PERF_SERVER_READY pid={os.getpid()} port={args.port} "
+            f"control_port={args.control_port} stream_port={args.stream_port} "
+            f"startup_secs={startup_secs:.2f} "
+            f"rss_mb={psutil.Process().memory_info().rss / 1024 / 1024:.1f}",
+            flush=True,
+        )
 
-    await stop_event.wait()
-    LOGGER.info("shutting down")
-    await control_api.stop()
-    await mass.stop()
-    for patcher in patches:
-        patcher.stop()
+        await stop_event.wait()
+        LOGGER.info("shutting down")
+        await control_api.stop()
+        await mass.stop()
+        for patcher in patches:
+            patcher.stop()
 
 
 def main() -> None:
@@ -365,6 +493,8 @@ def main() -> None:
     parser.add_argument("--control-port", type=int, default=8099)
     parser.add_argument("--stream-port", type=int, default=8100)
     parser.add_argument("--log-level", default="warning")
+    parser.add_argument("--fingerprint-fixture", action="store_true")
+    parser.add_argument("--allocation-profile", type=Path)
     args = parser.parse_args()
 
     logging.basicConfig(
