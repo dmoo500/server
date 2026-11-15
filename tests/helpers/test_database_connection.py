@@ -93,6 +93,32 @@ async def _read_pragma_int(db: DatabaseConnection, pragma: str) -> int:
     return int(row[0])
 
 
+async def test_backup_includes_wal_on_exclusive_connection(
+    db_with_table: DatabaseConnection, tmp_path: pathlib.Path
+) -> None:
+    """A backup uses the open connection and includes committed WAL data."""
+    await db_with_table.insert("items", {"name": "retained", "plays": 2})
+    backup = DatabaseConnection(str(tmp_path / "backup.db"))
+    await asyncio.wait_for(db_with_table.backup(backup.db_path), timeout=5)
+    await backup.setup()
+    try:
+        assert await backup.get_row("items", {"name": "retained"}) is not None
+        await db_with_table.insert("items", {"name": "after-backup", "plays": 3})
+        assert await backup.get_row("items", {"name": "after-backup"}) is None
+    finally:
+        await backup.close()
+
+
+async def test_backup_rejects_uncommitted_transaction(
+    db_with_table: DatabaseConnection, tmp_path: pathlib.Path
+) -> None:
+    """An active write transaction fails explicitly instead of blocking its own backup."""
+    await db_with_table.execute("INSERT INTO items(name) VALUES ('uncommitted')")
+    with pytest.raises(OperationalError, match="active transaction"):
+        await db_with_table.backup(str(tmp_path / "backup.db"))
+    await db_with_table.commit()
+
+
 async def test_vacuum_spills_temp_storage_to_disk(db_connection: DatabaseConnection) -> None:
     """Test that vacuum runs with temp_store=FILE and restores temp_store=memory after."""
     executed: list[str] = []

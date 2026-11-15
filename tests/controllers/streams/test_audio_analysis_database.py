@@ -6,7 +6,7 @@ import logging
 import os
 import pathlib
 import sqlite3
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -85,6 +85,68 @@ async def _table_names(db: DatabaseConnection) -> set[str]:
         "SELECT name FROM main.sqlite_master WHERE type = 'table'", limit=0
     )
     return {r["name"] for r in rows}
+
+
+async def test_header_migration_retries_partial_failure_without_reset(
+    ctrl: AudioAnalysisController, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted migration retries idempotently while other provider data stays intact."""
+    await ctrl.setup_database()
+    for item_id, domain in (("1", "pilot"), ("2", "pilot"), ("3", "unrelated")):
+        await ctrl.database.insert(
+            AA_TABLE_ANALYSIS,
+            {
+                "media_type": "track",
+                "item_id": item_id,
+                "provider": "local",
+                "aa_provider_domain": domain,
+                "header": "old",
+                "payload": b"retained",
+            },
+        )
+    original_write = ctrl.database.execute_write
+    calls = 0
+
+    async def fail_second(query: str, values: dict[str, Any] | None = None) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("simulated disk failure")
+        await original_write(query, values)
+
+    def convert(raw: str | bytes) -> str | None:
+        return "new" if raw == "old" else None
+
+    monkeypatch.setattr(ctrl.database, "execute_write", fail_second)
+    assert not await ctrl.migrate_provider_headers("pilot", 1, convert)
+    marker = {"key": "pilot_header_version"}
+    assert await ctrl.database.get_row(AA_TABLE_SETTINGS, marker) is None
+    monkeypatch.setattr(ctrl.database, "execute_write", original_write)
+    assert await ctrl.migrate_provider_headers("pilot", 1, convert)
+    rows = await ctrl.database.get_rows(AA_TABLE_ANALYSIS, order_by="id")
+    assert [row["header"] for row in rows] == ["new", "new", "old"]
+    assert all(row["payload"] == b"retained" for row in rows)
+    assert len(list(tmp_path.glob("*.bak"))) == 2
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in tmp_path.glob("*.bak"))
+    assert await ctrl.migrate_provider_headers("pilot", 1, convert)
+    assert len(list(tmp_path.glob("*.bak"))) == 2
+
+
+async def test_newer_header_version_is_not_overwritten(ctrl: AudioAnalysisController) -> None:
+    """Unknown provider data versions stop conversion without modifying the marker."""
+    await ctrl.setup_database()
+    await ctrl.database.insert(
+        AA_TABLE_SETTINGS,
+        {
+            "key": "pilot_header_version",
+            "value": "2",
+            "type": "str",
+        },
+    )
+    assert not await ctrl.migrate_provider_headers("pilot", 1, lambda _header: None)
+    stored = await ctrl.database.get_row(AA_TABLE_SETTINGS, {"key": "pilot_header_version"})
+    assert stored is not None
+    assert stored["value"] == "2"
 
 
 async def _assert_analysis_unavailable(ctrl: AudioAnalysisController) -> None:

@@ -51,7 +51,7 @@ lyricsgenius==3.12.2
 markdownify==1.2.3
 mashumaro==3.22
 modern_colorthief==0.3.0
-music-assistant-fingerprint @ git+https://github.com/dmoo500/audio-fingerprint.git@7400c5d86e2c799c1f4034201eb4497161363a0d
+music-assistant-fingerprint @ git+https://github.com/dmoo500/audio-fingerprint.git@cbfa2fc0faaa6c986654df2ab14ce1dd1bfc6e55
 music-assistant-frontend @ https://github.com/music-assistant/frontend/releases/download/2.17.366/music_assistant_frontend-2.17.366-py3-none-any.whl#sha256=1f6c8be2ab7e3e0cf921d90a61d13afe33a958663ead90803f6793a2ea73725d
 music-assistant-models==1.1.238
 mutagen==1.48.1

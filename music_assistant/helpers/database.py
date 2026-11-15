@@ -573,6 +573,17 @@ class DatabaseConnection:
         finally:
             await self._db.execute("PRAGMA temp_store=memory;")
 
+    async def backup(self, target_path: str) -> None:
+        """
+        Back up committed data, including WAL pages, through the existing connection.
+
+        :param target_path: Path of the destination SQLite database.
+        """
+        if self._db.in_transaction:
+            raise OperationalError("Cannot back up a database with an active transaction")
+        async with aiosqlite.connect(target_path) as target:
+            await self._db.backup(target)
+
     async def _get_pragma_int(self, pragma: str) -> int:
         """Return the integer value of a single-value sqlite PRAGMA."""
         async with self._db.execute(f"PRAGMA {pragma}") as cursor:

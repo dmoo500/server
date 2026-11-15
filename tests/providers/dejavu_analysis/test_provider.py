@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
 from aiohttp import ClientSession, web
+from music_assistant_fingerprint.codec import ENCODING_ID, decode_document
 from music_assistant_models.enums import ConfigEntryType, ContentType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Album, Artist, AudioFormat, Track
@@ -20,7 +22,17 @@ from music_assistant_models.streamdetails import StreamDetails
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.controllers.streams.audio_analysis_codec import encode
+from music_assistant.controllers.streams.audio_analysis_database import (
+    AudioAnalysisDatabaseMixin,
+    create_analysis_tables,
+)
+from music_assistant.controllers.streams.constants import (
+    AA_DB_FILENAME,
+    AA_TABLE_ANALYSIS,
+    AA_TABLE_SETTINGS,
+)
 from music_assistant.helpers.app_vars import app_var
+from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.models.audio_analysis import AudioAnalysisData, AudioAnalysisError
 from music_assistant.providers.dejavu_analysis import (
     CONF_APPLICATION_KEY,
@@ -63,6 +75,14 @@ async def _provider(
         side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)
     )
     await provider.handle_async_init()
+    response = MagicMock(status=200)
+    raw = json.dumps({"api_version": 1, "fingerprint_encodings": [ENCODING_ID]}).encode()
+    response.content.readexactly = AsyncMock(side_effect=asyncio.IncompleteReadError(raw, 4097))
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=False)
+    mass.http_session.get.return_value = context
+    mass.streams.audio_analysis.migrate_provider_headers = AsyncMock(return_value=True)
     return provider
 
 
@@ -232,7 +252,9 @@ async def test_upload_requires_matching_durable_acknowledgement(ack_status: str)
     provider = await _provider(upload=True)
     assert isinstance(provider.mass, MagicMock)
     extra = await _envelope(provider)
-    body = json.dumps(extra["dejavu"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    body = json.dumps(
+        decode_document(extra["dejavu"]), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
     key = hashlib.sha256(body.encode()).hexdigest()
     _response(provider, 202, {"submission_id": key, "status": ack_status})
 
@@ -324,7 +346,9 @@ async def test_recovery_uploads_current_analysis_without_reanalyzing(
     provider.mass.streams.audio_analysis.get_audio_analysis_version.return_value = 2
     stream = _stream()
     assert not await provider.start_analysis("current", stream, stream.audio_format)
-    body = json.dumps(extra["dejavu"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    body = json.dumps(
+        decode_document(extra["dejavu"]), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
     key = hashlib.sha256(body.encode()).hexdigest()
     _response(provider, 202, {"submission_id": key, "status": "queued"})
 
@@ -408,13 +432,21 @@ async def test_real_http_submission_uses_documented_wire_contract(
     async def ingest(request: web.Request) -> web.Response:
         raw = await request.read()
         received.append(json.loads(raw))
-        key = hashlib.sha256(raw).hexdigest()
+        canonical = json.dumps(
+            decode_document(json.loads(raw)), sort_keys=True, separators=(",", ":")
+        )
+        key = hashlib.sha256(canonical.encode()).hexdigest()
         assert request.headers["Idempotency-Key"] == key
         assert request.headers["X-API-Key"] == "test-key"
         assert request.headers.get("X-Application-Key") == (application_key or None)
         return web.json_response({"submission_id": key, "status": "queued"}, status=202)
 
     app = web.Application()
+
+    async def capabilities(_request: web.Request) -> web.Response:
+        return web.json_response({"api_version": 1, "fingerprint_encodings": [ENCODING_ID]})
+
+    app.router.add_get("/api/v1/dejavu/capabilities", capabilities)
     app.router.add_post("/api/v1/dejavu/submissions", ingest)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -441,6 +473,7 @@ async def test_real_http_submission_uses_documented_wire_contract(
             "windows",
             "fingerprints",
             "metadata",
+            "fingerprints_encoding",
         }
         assert "private-provider" not in json.dumps(received)
         assert not application_key or application_key not in json.dumps(received)
@@ -474,7 +507,9 @@ async def test_central_application_key_and_override(
     provider = await _provider(upload=True, application_key=override)
     assert isinstance(provider.mass, MagicMock)
     extra = await _envelope(provider)
-    body = json.dumps(extra["dejavu"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    body = json.dumps(
+        decode_document(extra["dejavu"]), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
     identifier = hashlib.sha256(body.encode()).hexdigest()
     _response(provider, 202, {"submission_id": identifier, "status": "queued"})
     await provider._upload(extra)
@@ -482,7 +517,7 @@ async def test_central_application_key_and_override(
     assert request.kwargs["headers"]["X-Application-Key"] == (
         override or "central-application-token"
     )
-    assert calls == ([] if override else ["dejavu_application_key"])
+    assert calls == ([] if override else ["dejavu_application_key"] * 2)
     assert "central-application-token" not in json.dumps(extra)
     assert "specific-server-token" not in json.dumps(extra)
     provider.mass.http_session.post.assert_called_once()
@@ -523,9 +558,181 @@ async def test_legacy_pending_upload_is_still_recoverable() -> None:
     assert isinstance(provider.mass, MagicMock)
     extra = await _envelope(provider)
     extra["dejavu"]["format_id"] = "ma-dejavu-landmarks-v1"
-    body = json.dumps(extra["dejavu"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+    body = json.dumps(
+        decode_document(extra["dejavu"]), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
     identifier = hashlib.sha256(body.encode()).hexdigest()
     _response(provider, 202, {"submission_id": identifier, "status": "queued"})
     await provider._upload(extra)
     provider.mass.http_session.post.assert_called_once()
     assert provider.mass.cache.set.call_args.args[1] == {"accepted": True}
+
+
+async def test_compact_capability_rejection_stops_uploads() -> None:
+    """Old receivers fail explicitly before a compact POST is sent."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    context = provider.mass.http_session.get.return_value
+    raw = json.dumps({"api_version": 1, "fingerprint_encodings": ["json"]}).encode()
+    context.__aenter__.return_value.content.readexactly.side_effect = asyncio.IncompleteReadError(
+        raw, 4097
+    )
+    await provider._upload(await _envelope(provider))
+    assert provider._upload_blocked
+    provider.mass.http_session.post.assert_not_called()
+
+
+async def test_capability_and_recovered_uploads_share_request_pacing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The initial capability GET and consecutive recovery POSTs each respect the rate limit."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    clock = 10.0
+    requests: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        nonlocal clock
+        clock += delay
+
+    monkeypatch.setattr("music_assistant.providers.dejavu_analysis.time.monotonic", lambda: clock)
+    monkeypatch.setattr("music_assistant.providers.dejavu_analysis.asyncio.sleep", sleep)
+    get_context = provider.mass.http_session.get.return_value
+
+    def get(*_args: Any, **_kwargs: Any) -> MagicMock:
+        requests.append(clock)
+        assert isinstance(get_context, MagicMock)
+        return get_context
+
+    def post(*_args: Any, **_kwargs: Any) -> MagicMock:
+        requests.append(clock)
+        assert isinstance(provider.mass, MagicMock)
+        context = provider.mass.http_session.post.return_value
+        assert isinstance(context, MagicMock)
+        return context
+
+    provider.mass.http_session.get.side_effect = get
+    provider.mass.http_session.post.side_effect = post
+    for title in ("first", "second", "third"):
+        extra["dejavu"]["metadata"]["title"] = title
+        body = json.dumps(decode_document(extra["dejavu"]), sort_keys=True, separators=(",", ":"))
+        identifier = hashlib.sha256(body.encode()).hexdigest()
+        _response(provider, 202, {"submission_id": identifier, "status": "queued"})
+        await provider._upload(extra)
+    assert requests == [10.0, 11.0, 12.0, 13.0]
+    provider.mass.http_session.get.assert_called_once()
+
+
+async def test_compact_upload_retains_legacy_identity() -> None:
+    """Recovered legacy results retain their ID while using compact delivery."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    extra["dejavu"] = decode_document(extra["dejavu"])
+    canonical = json.dumps(extra["dejavu"], sort_keys=True, separators=(",", ":"))
+    identifier = hashlib.sha256(canonical.encode()).hexdigest()
+    _response(provider, 202, {"submission_id": identifier, "status": "queued"})
+    await provider._upload(extra)
+    wire = json.loads(provider.mass.http_session.post.call_args.kwargs["data"])
+    assert wire["fingerprints_encoding"] == ENCODING_ID
+    assert decode_document(wire) == extra["dejavu"]
+    assert (
+        provider.mass.http_session.post.call_args.kwargs["headers"]["Idempotency-Key"] == identifier
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"not JSON",
+        b" " * 4097,
+        b'{"api_version":true,"fingerprint_encodings":[]}',
+    ],
+)
+async def test_invalid_capabilities_stop_uploads(raw: bytes) -> None:
+    """Malformed and oversized capability responses cannot acknowledge support."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    response = provider.mass.http_session.get.return_value.__aenter__.return_value
+    response.content.readexactly.side_effect = asyncio.IncompleteReadError(raw, 4097)
+    await provider._upload(await _envelope(provider))
+    assert provider._upload_blocked
+    provider.mass.http_session.post.assert_not_called()
+
+
+async def test_consent_revoked_during_capability_check_is_respected() -> None:
+    """A support response cannot override consent changed while awaiting the network."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    assert isinstance(provider.config, MagicMock)
+    response = provider.mass.http_session.get.return_value.__aenter__.return_value
+
+    async def revoke(_size: int) -> bytes:
+        assert isinstance(provider.config, MagicMock)
+        provider.config.get_value.side_effect = lambda _key: None
+        raw = json.dumps({"api_version": 1, "fingerprint_encodings": [ENCODING_ID]}).encode()
+        raise asyncio.IncompleteReadError(raw, 4097)
+
+    response.content.readexactly.side_effect = revoke
+    await provider._upload(await _envelope(provider))
+    provider.mass.http_session.post.assert_not_called()
+    provider.mass.cache.set.assert_not_awaited()
+
+
+async def test_existing_analysis_migration_preserves_header_payload_and_consent(
+    tmp_path: Path,
+) -> None:
+    """Existing headers compact once without rewriting payloads or granting upload consent."""
+    provider = await _provider()
+    assert isinstance(provider.mass, MagicMock)
+    provider.mass.storage_path = str(tmp_path)
+    database = DatabaseConnection(str(tmp_path / AA_DB_FILENAME))
+    await database.setup()
+    try:
+        await create_analysis_tables(database)
+        extra = await _envelope(provider)
+        extra["dejavu"] = decode_document(extra["dejavu"])
+        header, payload = encode(AudioAnalysisData(extra_data=extra, beats=[1.0, 2.0]))
+        values = {
+            "media_type": "track",
+            "item_id": "track",
+            "provider": "test",
+            "aa_provider_domain": "dejavu_analysis",
+            "header": header,
+            "payload": payload,
+            "analysis_version": 2,
+            "timestamp_created": 123,
+        }
+        await database.insert(AA_TABLE_ANALYSIS, values)
+        await database.insert(
+            AA_TABLE_ANALYSIS, {**values, "item_id": "broken", "header": "not JSON"}
+        )
+        controller = AudioAnalysisDatabaseMixin()
+        controller._database = database
+        controller._database_ready = True
+        controller.logger = provider.logger
+        provider.mass.streams.audio_analysis = controller
+        await provider.loaded_in_mass()
+        row = await database.get_row(AA_TABLE_ANALYSIS, {"item_id": "track"})
+        assert row is not None
+        assert row["payload"] == payload
+        assert row["timestamp_created"] == 123
+        assert row["analysis_version"] == 2
+        converted = json.loads(row["header"])
+        assert converted["arrays"] == json.loads(header)["arrays"]
+        assert converted["extra_data"]["upload_destination"] is None
+        assert decode_document(converted["extra_data"]["dejavu"]) == extra["dejavu"]
+        broken = await database.get_row(AA_TABLE_ANALYSIS, {"item_id": "broken"})
+        assert broken is not None
+        assert broken["header"] == "not JSON"
+        marker = await database.get_row(
+            AA_TABLE_SETTINGS, {"key": "dejavu_analysis_header_version"}
+        )
+        assert marker is not None
+        assert marker["value"] == "1"
+        assert len(list(tmp_path.glob("*.bak"))) == 1
+        await provider.loaded_in_mass()
+        assert len(list(tmp_path.glob("*.bak"))) == 1
+    finally:
+        await database.close()

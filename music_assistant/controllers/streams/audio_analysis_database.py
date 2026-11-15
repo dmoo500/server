@@ -16,6 +16,9 @@ import asyncio
 import contextlib
 import os
 import sqlite3
+import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from music_assistant_models.errors import ProviderUnavailableError
@@ -28,6 +31,7 @@ from music_assistant.constants import (
 from music_assistant.controllers.streams.constants import (
     AA_DB_FILENAME,
     AA_DB_SCHEMA_VERSION,
+    AA_TABLE_ANALYSIS,
     AA_TABLE_SETTINGS,
 )
 from music_assistant.helpers.database import DatabaseConnection
@@ -36,6 +40,11 @@ if TYPE_CHECKING:
     import logging
 
     from music_assistant import MusicAssistant
+
+
+def _create_private_file(path: str) -> None:
+    """Create an owner-only file without replacing an existing path."""
+    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
 
 
 async def create_analysis_tables(database: DatabaseConnection, schema: str = "main") -> int:
@@ -126,6 +135,82 @@ class AudioAnalysisDatabaseMixin:
         self._require_database()
         assert self._database is not None
         return self._database
+
+    async def migrate_provider_headers(
+        self, provider_domain: str, version: int, converter: Callable[[str | bytes], str | None]
+    ) -> bool:
+        """
+        Migrate provider-owned headers once, preserving analysis identity and binary data.
+
+        :param provider_domain: Domain owning the analysis rows.
+        :param version: Provider-local data version, independent of analysis and DB schema versions.
+        :param converter: Idempotent, IO-free header conversion; None leaves a row unchanged.
+        :returns: Whether the migration completed or had already completed.
+        """
+        if not self.database_ready:
+            self.logger.error("Cannot migrate %s analyses: database unavailable", provider_domain)
+            return False
+        database = self.database
+        key = f"{provider_domain}_header_version"
+        backup_path: Path | None = None
+        backup_created = False
+        backup_complete = False
+        try:
+            stored = await database.get_row(AA_TABLE_SETTINGS, {"key": key})
+            if stored is not None:
+                if stored["value"] != str(version):
+                    self.logger.error("Unsupported stored header version for %s", provider_domain)
+                    return False
+                return True
+            backup_path = Path(database.db_path).with_name(
+                f"{AA_DB_FILENAME}.pre-header-migration-{time.time_ns()}.bak"
+            )
+            await asyncio.to_thread(_create_private_file, str(backup_path))
+            backup_created = True
+            await database.backup(str(backup_path))
+            backup_complete = True
+            self.logger.warning("Backed up audio analysis before migration: %s", backup_path)
+            last_id = 0
+            while rows := await database.get_rows_from_query(
+                f"SELECT id,header FROM {AA_TABLE_ANALYSIS} "
+                "WHERE aa_provider_domain=:domain AND id>:last_id ORDER BY id",
+                {"domain": provider_domain, "last_id": last_id},
+                limit=1,
+            ):
+                row = rows[0]
+                last_id = row["id"]
+                try:
+                    header = await asyncio.to_thread(converter, row["header"])
+                except (ValueError, TypeError, UnicodeError) as err:
+                    self.logger.warning(
+                        "Retaining unconvertible %s analysis %s: %s",
+                        provider_domain,
+                        row["id"],
+                        type(err).__name__,
+                    )
+                    continue
+                if header is not None:
+                    await database.execute_write(
+                        f"UPDATE {AA_TABLE_ANALYSIS} SET header=:new_header "
+                        "WHERE id=:id AND header=:old_header",
+                        {"id": row["id"], "old_header": row["header"], "new_header": header},
+                    )
+            await database.insert_or_replace(
+                AA_TABLE_SETTINGS, {"key": key, "value": str(version), "type": "str"}
+            )
+        except (sqlite3.Error, OSError, ValueError) as err:
+            self.logger.error(
+                "Analysis header migration for %s failed; data retained, restart to retry: %s",
+                provider_domain,
+                err,
+            )
+            if backup_path is not None and backup_created and not backup_complete:
+                try:
+                    await asyncio.to_thread(backup_path.unlink, missing_ok=True)
+                except OSError as cleanup_error:
+                    self.logger.warning("Cannot remove incomplete backup: %s", cleanup_error)
+            return False
+        return True
 
     async def setup_database(self) -> None:
         """

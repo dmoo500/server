@@ -21,6 +21,7 @@ from music_assistant_fingerprint import (
     SAMPLE_RATE,
     WindowSampler,
 )
+from music_assistant_fingerprint.codec import ENCODING_ID, decode_document, encode_document
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
@@ -90,12 +91,18 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         self._upload_blocked = False
         self._retry_at = 0.0
         self._next_request_at = 0.0
+        self._capability_destination: str | None = None
         self._destination = self._configured_destination()
         if self._destination and not self.config.get_value(CONF_KEY):
             raise InvalidDataError("An API key is required when sharing fingerprints")
 
     async def loaded_in_mass(self) -> None:
         """Recover eligible uploads after the analysis database is available."""
+        if not await self.mass.streams.audio_analysis.migrate_provider_headers(
+            self.domain, 1, self._compact_header
+        ):
+            self._upload_blocked = True
+            return
         if self._destination:
             self._start_recovery()
 
@@ -243,8 +250,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         if len(data.hashes) > MAX_RESULT_HASHES:
             raise AudioAnalysisError("Fingerprint count exceeds the analysis limit")
         document = await self._run_offloaded(self._build_document, data)
+        decoded = await self._run_offloaded(decode_document, document)
         body = await self._run_offloaded(
-            json.dumps, document, sort_keys=True, separators=(",", ":"), allow_nan=False
+            json.dumps, decoded, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
         if len(body.encode("utf-8")) > MAX_RESULT_BYTES:
             raise AudioAnalysisError("Fingerprint result exceeds the storage limit")
@@ -256,17 +264,19 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
     @staticmethod
     def _build_document(data: FingerprintSession) -> dict[str, Any]:
         """Build the submission document from completed sampled coverage."""
-        return {
-            "format_id": FORMAT_ID,
-            "sample_rate": SAMPLE_RATE,
-            "offset_unit": "fft_hops",
-            "windows": [
-                {"start_sample": window.start_sample, "sample_count": window.sample_count}
-                for window in data.sampler.completed
-            ],
-            "fingerprints": [list(pair) for pair in sorted(set(data.hashes))],
-            "metadata": data.metadata,
-        }
+        return encode_document(
+            {
+                "format_id": FORMAT_ID,
+                "sample_rate": SAMPLE_RATE,
+                "offset_unit": "fft_hops",
+                "windows": [
+                    {"start_sample": window.start_sample, "sample_count": window.sample_count}
+                    for window in data.sampler.completed
+                ],
+                "fingerprints": [list(pair) for pair in sorted(set(data.hashes))],
+                "metadata": data.metadata,
+            }
+        )
 
     def _configured_destination(self) -> str | None:
         """Validate a consent-enabled submission URL without exposing credentials."""
@@ -337,9 +347,14 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             ):
                 self.logger.error("Cannot upload an unsupported fingerprint envelope")
                 return
-            body = await self._run_offloaded(
-                json.dumps, document, sort_keys=True, separators=(",", ":"), allow_nan=False
-            )
+            try:
+                decoded = await self._run_offloaded(decode_document, document)
+                body = await self._run_offloaded(
+                    json.dumps, decoded, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+            except (ValueError, TypeError, UnicodeError) as err:
+                self.logger.error("Invalid stored fingerprint upload: %s", err)
+                return
             if len(body.encode("utf-8")) > MAX_RESULT_BYTES:
                 self.logger.error("Stored fingerprint upload exceeds the size limit")
                 return
@@ -353,20 +368,28 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     self._retry_at = status["retry_at"]
                     self._schedule_retry()
                     return
-            if (delay := self._next_request_at - time.monotonic()) > 0:
-                await asyncio.sleep(delay)
             if self.unloading or self._configured_destination() != destination:
                 return
-            self._next_request_at = time.monotonic() + 1
             retry_delay = RETRY_SECONDS
             try:
-                await self._post_document(destination, body, submission_id)
+                await self._check_capabilities(destination)
+                compact = await self._run_offloaded(encode_document, decoded)
+                compact_body = await self._run_offloaded(
+                    json.dumps, compact, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+                if self.unloading or self._configured_destination() != destination:
+                    return
+                if not await self._post_document(destination, compact_body, submission_id):
+                    return
             except UploadDeferred as err:
                 retry_delay = err.retry_seconds
                 self.logger.warning("Fingerprint upload deferred: HTTP %s", err.status)
             except InvalidDataError as err:
                 self._upload_blocked = True
                 self.logger.error("Fingerprint uploads stopped: %s", err)
+                return
+            except (ValueError, TypeError, UnicodeError) as err:
+                self.logger.error("Cannot encode stored fingerprint upload: %s", err)
                 return
             except (TimeoutError, aiohttp.ClientError) as err:
                 self.logger.warning("Fingerprint upload failed: %s", type(err).__name__)
@@ -387,20 +410,84 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             )
             self._schedule_retry()
 
-    async def _post_document(self, destination: str, body: str, submission_id: str) -> None:
-        """Submit a document and require an acknowledgement of durable server acceptance."""
+    async def _check_capabilities(self, destination: str) -> None:
+        if self._capability_destination == destination:
+            return
+        headers = await self._upload_headers()
+        await self._pace_request()
+        if self.unloading or self._configured_destination() != destination:
+            return
+        async with self.mass.http_session.get(
+            destination.rsplit("/", 1)[0] + "/capabilities",
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+            allow_redirects=False,
+        ) as response:
+            if response.status == 429 or response.status >= 500:
+                raise UploadDeferred(response.status, RETRY_SECONDS)
+            if response.status != 200:
+                raise InvalidDataError(
+                    f"Fingerprint capability check returned HTTP {response.status}; "
+                    "update the receiver and gateway before enabling compact uploads"
+                )
+            try:
+                raw = await response.content.readexactly(4097)
+            except asyncio.IncompleteReadError as err:
+                raw = err.partial
+            if len(raw) > 4096:
+                raise InvalidDataError("Fingerprint capabilities exceed the size limit")
+            try:
+                capabilities = json.loads(raw)
+            except (ValueError, UnicodeError) as err:
+                raise InvalidDataError("Invalid fingerprint capabilities") from err
+            if (
+                not isinstance(capabilities, dict)
+                or type(capabilities.get("api_version")) is not int
+                or capabilities.get("api_version") != 1
+                or not isinstance(capabilities.get("fingerprint_encodings"), list)
+                or ENCODING_ID not in capabilities["fingerprint_encodings"]
+            ):
+                raise InvalidDataError("Receiver does not support compact fingerprint uploads")
+        self._capability_destination = destination
+
+    async def _pace_request(self) -> None:
+        """Space outbound requests on the serialized upload path at least one second apart."""
+        if (delay := self._next_request_at - time.monotonic()) > 0:
+            await asyncio.sleep(delay)
+        self._next_request_at = time.monotonic() + 1
+
+    async def _upload_headers(self) -> dict[str, str]:
         application_key = self.config.get_value(CONF_APPLICATION_KEY)
         if not application_key:
             application_key = await self._run_offloaded(app_var, "dejavu_application_key")
         headers = {
             "Content-Type": "application/json",
             "X-API-Key": str(self.config.get_value(CONF_KEY)),
-            "Idempotency-Key": submission_id,
         }
         if application_key:
             if not isinstance(application_key, str):
                 raise InvalidDataError("The fingerprint application token must be a string")
             headers["X-Application-Key"] = application_key
+        return headers
+
+    @staticmethod
+    def _compact_header(raw: str | bytes) -> str | None:
+        header = json.loads(raw)
+        if not isinstance(header, dict):
+            raise TypeError("Invalid analysis header")
+        extra = header.get("extra_data")
+        if not isinstance(extra, dict) or not isinstance(extra.get("dejavu"), dict):
+            return None
+        extra["dejavu"] = encode_document(extra["dejavu"])
+        return json.dumps(header, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    async def _post_document(self, destination: str, body: str, submission_id: str) -> bool:
+        """Submit a document and require an acknowledgement of durable server acceptance."""
+        headers = await self._upload_headers()
+        headers["Idempotency-Key"] = submission_id
+        await self._pace_request()
+        if self.unloading or self._configured_destination() != destination:
+            return False
         async with self.mass.http_session.post(
             destination,
             data=body,
@@ -446,3 +533,4 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     "Fingerprint contribution accepted but awaiting complete metadata; "
                     "it is not available for recognition"
                 )
+        return True

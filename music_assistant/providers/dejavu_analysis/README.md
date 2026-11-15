@@ -16,8 +16,8 @@ Use MA's existing development Python with that `PYTHONPATH`. The installed packa
 lets the normal provider loader satisfy the exact manifest pin without contacting PyPI.
 Repeat the local installation after changing the shared library.
 
-The manifest pin is a local-development placeholder, not a published dependency. Do not submit
-this provider upstream until the package has a release and its compatibility has been verified.
+The manifest references a published Git commit, not a PyPI release. Do not submit this
+independent prototype upstream without maintainer agreement and verified compatibility.
 
 The provider analyzes the PCM already decoded for normal playback, including streaming tracks.
 It does not fetch additional audio, write decoded audio to disk, or expand background scanning
@@ -62,8 +62,10 @@ implements this endpoint locally. The older general analysis server is unchanged
 - `X-API-Key`: upload authentication (personal key with upload permission in gateway mode).
 - `X-Application-Key`: additional application authentication when a fingerprint application
   token is supplied. This is never a local Music Assistant login token.
-- `Idempotency-Key`: SHA-256 of the canonical JSON request body.
-- Body: `format_id`, `sample_rate`, `offset_unit`, `windows`, `fingerprints`, `metadata`.
+- `Idempotency-Key`: SHA-256 of decoded canonical JSON, without `fingerprints_encoding`.
+- Body: `format_id`, `sample_rate`, `offset_unit`, `windows`, `fingerprints`, `metadata`,
+  `fingerprints_encoding`. Fingerprints use the shared lossless
+  `sha1-80-offset-delta-v1` binary/delta/base64 encoding.
 - Offsets are integer 2,048-sample FFT hops at 44,100 Hz relative to the track.
 - `format_id` identifies the shared algorithm and its fixed parameters.
 - New full-track documents use `ma-dejavu-landmarks-v2`; the receiver also accepts
@@ -97,6 +99,29 @@ The full spectrogram is never retained; batches are discarded after their peaks
 have been extracted.
 Existing analysis and receiver data remain compatible; no version-triggered
 reanalysis or database migration is required for this optimization.
+
+## Compact storage upgrade (library 0.3.0)
+
+Update the receiver and its gateway capability route before the producer.
+The provider checks authenticated `GET /api/v1/dejavu/capabilities` before its first
+upload to a destination. Unsupported receivers stop uploads explicitly.
+Legacy stored results use compact delivery too, but retain the original canonical
+document's submission ID, cached acceptance and destination-bound consent.
+
+Existing local fingerprint headers are migrated through the audio-analysis controller.
+A private SQLite backup is created using its already-open connection, including WAL data.
+Only this provider's headers change; binary analysis arrays, row IDs, timestamps,
+analysis versions and recorded upload destinations remain unchanged.
+Malformed or noncanonical legacy rows are logged and retained. Per-row conversions are
+idempotent; a failed migration keeps the marker unset for retry on restart and blocks
+uploads without resetting the database or interrupting playback.
+Allow disk space for the full audio-analysis backup; backups are not deleted automatically.
+SQLite may reuse freed pages without making the physical file smaller.
+
+The provider-local `dejavu_analysis_header_version` marker is 1.
+MA analysis version remains 2, and acoustic formats remain v1/v2: packing changes neither
+the algorithm nor coverage and triggers no reanalysis or additional audio fetching.
+Receiver database schema is independently versioned at 3; HTTP API major remains 1.
 
 ## Application credentials
 

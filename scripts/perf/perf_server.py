@@ -201,6 +201,8 @@ class ControlApi:
         return web.json_response(result)
 
     async def _handle_fingerprints(self, request: web.Request) -> web.Response:
+        from music_assistant_fingerprint.codec import decode_document  # noqa: PLC0415
+
         from music_assistant.controllers.streams.audio_analysis_codec import (  # noqa: PLC0415
             decode_extra_data,
         )
@@ -211,7 +213,7 @@ class ControlApi:
             extra = await asyncio.to_thread(decode_extra_data, row["header"])
             if extra is None:
                 raise web.HTTPInternalServerError(text="Invalid stored fingerprint document")
-            doc = extra["dejavu"]
+            doc = await asyncio.to_thread(decode_document, extra["dejavu"])
             end = 0
             full = True
             for window in doc.get("windows", []):
