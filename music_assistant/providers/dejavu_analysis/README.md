@@ -85,6 +85,11 @@ recoverable pending upload.
 The ingestion worker, recognition API and microphone test page live in the separate fingerprint
 server project, not in this MA provider.
 
+For shared analysis, metadata is read from the existing library entry or the
+matching resolved queue item when the track is not in the library. This does not
+fetch the provider item again. Queue metadata is accepted only for the same
+stream URI, never from another playing/preloaded track.
+
 The shared library's 0.2.2 update reduces temporary FFT/filter allocations without
 changing the v2 fingerprints or coverage. FFTs run in batches and peak filtering
 uses overlapping halos, retaining float64 precision and the same neighborhoods.

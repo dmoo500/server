@@ -24,6 +24,7 @@ from music_assistant_fingerprint import (
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
+from music_assistant_models.media_items import Track
 from yarl import URL
 
 from music_assistant.controllers.streams.audio_analysis_codec import decode_extra_data
@@ -33,7 +34,7 @@ from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.media_items import AudioFormat, Track
+    from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.provider import ProviderManifest
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -165,8 +166,8 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         metadata: dict[str, Any] = {"duration": streamdetails.duration}
         destination = self._configured_destination()
         if destination:
-            # Only existing library metadata is consulted; this never fetches provider audio
-            # or triggers online enrichment. Stream URLs and provider IDs are not submitted.
+            # Only existing library/queue metadata is consulted; this never fetches provider
+            # audio or triggers online enrichment. Stream URLs and provider IDs are not submitted.
             track: Track | None
             if streamdetails.provider == "library":
                 track = await self.mass.music.tracks.get_library_item(streamdetails.item_id)
@@ -174,6 +175,22 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 track = await self.mass.music.tracks.get_library_item_by_prov_id(
                     streamdetails.item_id, streamdetails.provider
                 )
+            if track is None and streamdetails.queue_id:
+                offset = 0
+                while items := self.mass.player_queues.items(streamdetails.queue_id, 100, offset):
+                    track = next(
+                        (
+                            item.media_item
+                            for item in items
+                            if item.streamdetails is not None
+                            and item.streamdetails.uri == streamdetails.uri
+                            and isinstance(item.media_item, Track)
+                        ),
+                        None,
+                    )
+                    if track is not None:
+                        break
+                    offset += len(items)
             if track is not None:
                 metadata.update(
                     title=track.name,
@@ -189,6 +206,15 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     if streamdetails.stream_metadata.artist
                     else [],
                     album=streamdetails.stream_metadata.album,
+                )
+            if (
+                not metadata.get("title")
+                or not metadata.get("artists")
+                or not metadata.get("album")
+            ):
+                self.logger.warning(
+                    "Fingerprint metadata lacks title, artist or album; the receiver must "
+                    "hold this contribution pending metadata"
                 )
         self._data[session_id] = FingerprintSession(sampler, destination, metadata)
         return True
@@ -412,6 +438,11 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             if (
                 not isinstance(acknowledgement, dict)
                 or acknowledgement.get("submission_id") != submission_id
-                or acknowledgement.get("status") not in ("queued", "processed")
+                or acknowledgement.get("status") not in ("queued", "processed", "pending_metadata")
             ):
                 raise InvalidDataError("Fingerprint server returned an invalid acknowledgement")
+            if acknowledgement["status"] == "pending_metadata":
+                self.logger.warning(
+                    "Fingerprint contribution accepted but awaiting complete metadata; "
+                    "it is not available for recognition"
+                )

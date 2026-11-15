@@ -12,10 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 import numpy as np
 import pytest
 from aiohttp import ClientSession, web
-from music_assistant_models.enums import ConfigEntryType, ContentType, MediaType
+from music_assistant_models.enums import ConfigEntryType, ContentType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
-from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.media_items import Album, Artist, AudioFormat, Track
+from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
+from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.controllers.streams.audio_analysis_codec import encode
 from music_assistant.helpers.app_vars import app_var
@@ -115,6 +117,52 @@ async def test_cancel_discards_fingerprints_without_upload() -> None:
     assert not provider._data
 
 
+async def test_shared_metadata_uses_existing_queue_track_without_provider_fetch() -> None:
+    """Tracks outside the library retain queued metadata without another network lookup."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    stream = _stream()
+    stream.queue_id = "queue"
+    track = Track(
+        item_id=stream.item_id,
+        provider=stream.provider,
+        name="Queued track",
+        artists=UniqueList(
+            [
+                Artist(
+                    item_id="artist", provider="test", name="Queued artist", provider_mappings=set()
+                )
+            ]
+        ),
+        album=Album(item_id="album", provider="test", name="Queued album", provider_mappings=set()),
+        provider_mappings=set(),
+        external_ids={(ExternalID.ISRC, "USAAA2600001")},
+    )
+    item = QueueItem.from_media_item("queue", track)
+    item.streamdetails = stream
+    provider.mass.player_queues.items.side_effect = lambda *_args: [item]
+    assert await provider.start_analysis("session", stream, stream.audio_format)
+    metadata = provider._data["session"].metadata
+    assert metadata["title"] == "Queued track"
+    assert metadata["artists"] == ["Queued artist"]
+    assert metadata["album"] == "Queued album"
+    assert metadata["isrc"] == "USAAA2600001"
+    provider.mass.music.get_item_by_uri.assert_not_called()
+
+
+async def test_queue_fallback_does_not_use_a_different_track() -> None:
+    """Another queue item's metadata must never be attached to the analyzed recording."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    stream = _stream()
+    stream.queue_id = "queue"
+    other = MagicMock()
+    other.streamdetails.uri = "track://other/track"
+    provider.mass.player_queues.items.side_effect = [[other], []]
+    assert await provider.start_analysis("session", stream, stream.audio_format)
+    assert provider._data["session"].metadata == {"duration": 5}
+
+
 async def test_incomplete_window_cannot_be_finalized() -> None:
     """Unfinished planned windows are not accepted as complete analysis."""
     provider = await _provider()
@@ -178,14 +226,15 @@ def _response(provider: DejavuAnalysisProvider, status: int, document: dict[str,
     provider.mass.http_session.post.return_value = context
 
 
-async def test_upload_requires_matching_durable_acknowledgement() -> None:
+@pytest.mark.parametrize("ack_status", ["queued", "processed", "pending_metadata"])
+async def test_upload_requires_matching_durable_acknowledgement(ack_status: str) -> None:
     """Only an acknowledgement of the exact submitted document marks delivery."""
     provider = await _provider(upload=True)
     assert isinstance(provider.mass, MagicMock)
     extra = await _envelope(provider)
     body = json.dumps(extra["dejavu"], sort_keys=True, separators=(",", ":"), allow_nan=False)
     key = hashlib.sha256(body.encode()).hexdigest()
-    _response(provider, 202, {"submission_id": key, "status": "queued"})
+    _response(provider, 202, {"submission_id": key, "status": ack_status})
 
     await provider._upload(extra)
 
