@@ -91,8 +91,10 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         self._recovery_timer: asyncio.TimerHandle | None = None
         self._upload_blocked = False
         self._retry_at = 0.0
+        self._availability_retry_at = 0.0
         self._next_request_at = 0.0
         self._capability_destination: str | None = None
+        self._availability_supported = False
         self._destination = self._configured_destination()
         if self._destination and not self.config.get_value(CONF_KEY):
             raise InvalidDataError("An API key is required when sharing fingerprints")
@@ -162,15 +164,6 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         if not streamdetails.duration or not math.isfinite(streamdetails.duration):
             self.logger.debug("Skipping fingerprint analysis without a finite duration")
             return False
-        try:
-            sampler = WindowSampler(
-                streamdetails.duration,
-                audio_format.sample_rate,
-                audio_format.channels,
-                f"pcm_{audio_format.content_type.value}",
-            )
-        except ValueError as err:
-            raise AudioAnalysisError(str(err)) from err
         metadata: dict[str, Any] = {"duration": streamdetails.duration}
         destination = self._configured_destination()
         if destination:
@@ -192,6 +185,17 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     "Fingerprint metadata lacks required fields or a recording identifier; the receiver must "
                     "hold this contribution pending metadata"
                 )
+            if (await self._availability(destination, [metadata]))[0] == "full":
+                return False
+        try:
+            sampler = WindowSampler(
+                streamdetails.duration,
+                audio_format.sample_rate,
+                audio_format.channels,
+                f"pcm_{audio_format.content_type.value}",
+            )
+        except ValueError as err:
+            raise AudioAnalysisError(str(err)) from err
         self._data[session_id] = FingerprintSession(sampler, destination, metadata)
         return True
 
@@ -274,6 +278,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
     async def _recover_uploads(self) -> None:
         """Retry stored consent-eligible results, without reanalyzing tracks."""
         try:
+            pending: list[dict[str, Any]] = []
             async for (
                 row,
                 track,
@@ -315,9 +320,14 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                                 "Stored fingerprint metadata remains incomplete; "
                                 "no complete identity-matched library metadata is available"
                             )
-                    await self._upload(extra)
+                    pending.append(extra)
+                    if len(pending) == 100:
+                        await self._upload_recovered(pending, destination)
+                        pending = []
                 if self._upload_blocked or self.unloading or self._retry_at > time.time():
                     return
+            if pending and (destination := self._configured_destination()):
+                await self._upload_recovered(pending, destination)
         finally:
             if self._retry_at > time.time():
                 self._schedule_retry()
@@ -331,8 +341,36 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 task_id=f"{self.instance_id}_fingerprint_recovery",
             )
 
-    async def _upload(self, extra: dict[str, Any]) -> None:
+    async def _upload_recovered(self, extras: list[dict[str, Any]], destination: str) -> None:
+        extras = [extra for extra in extras if extra.get("upload_destination") == destination]
+        if not extras:
+            return
+        metadata = [
+            extra.get("dejavu", {}).get("metadata", {})
+            if isinstance(extra.get("dejavu"), dict)
+            else {}
+            for extra in extras
+        ]
+        statuses = await self._availability(destination, metadata)
+        for extra, status in zip(extras, statuses, strict=True):
+            if status != "full":
+                await self._upload(extra, availability_checked=True)
+            if self._upload_blocked or self.unloading or self._retry_at > time.time():
+                return
+
+    async def _upload(self, extra: dict[str, Any], availability_checked: bool = False) -> None:
         """Deliver one eligible result with idempotency and explicit failure handling."""
+        destination = self._configured_destination()
+        document = extra.get("dejavu")
+        if (
+            not availability_checked
+            and destination
+            and extra.get("upload_destination") == destination
+            and isinstance(document, dict)
+            and isinstance(document.get("metadata"), dict)
+            and (await self._availability(destination, [document["metadata"]]))[0] == "full"
+        ):
+            return
         async with self._upload_lock:
             destination = self._configured_destination()
             if (
@@ -427,7 +465,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             allow_redirects=False,
         ) as response:
             if response.status == 429 or response.status >= 500:
-                raise UploadDeferred(response.status, RETRY_SECONDS)
+                raise UploadDeferred(response.status, self._retry_delay(response.headers))
             if response.status != 200:
                 raise InvalidDataError(
                     f"Fingerprint capability check returned HTTP {response.status}; "
@@ -452,12 +490,236 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             ):
                 raise InvalidDataError("Receiver does not support compact fingerprint uploads")
         self._capability_destination = destination
+        self._availability_supported = (
+            type(capabilities.get("availability_version")) is int
+            and capabilities["availability_version"] == 1
+        )
+
+    async def _availability(self, destination: str, metadata: list[dict[str, Any]]) -> list[str]:
+        """Check published coverage, falling back to normal analysis on any remote failure."""
+        results = ["unknown"] * len(metadata)
+        if self.unloading or self._configured_destination() != destination:
+            return results
+        pairs = [
+            (position, item)
+            for position, source in enumerate(metadata)
+            if (item := self._availability_identity(source)) is not None
+        ]
+        positions = [position for position, _ in pairs]
+        items = [item for _, item in pairs]
+        if not items:
+            return results
+        try:
+            async with self._upload_lock:
+                if self._availability_retry_at > time.monotonic():
+                    return results
+                headers = await self._upload_headers()
+                credential = hashlib.sha256(
+                    json.dumps(headers, sort_keys=True).encode()
+                ).hexdigest()
+                keys = [
+                    hashlib.sha256(
+                        json.dumps([1, destination, credential, item], sort_keys=True).encode()
+                    ).hexdigest()
+                    for item in items
+                ]
+                missing: list[int] = []
+                cached_results = await asyncio.gather(
+                    *(
+                        self.mass.cache.get(key, provider=self.domain, allow_bypass=False)
+                        for key in keys
+                    )
+                )
+                for index, cached in enumerate(cached_results):
+                    if cached in ("full", "partial", "unknown"):
+                        results[positions[index]] = cached
+                    else:
+                        missing.append(index)
+                if not missing:
+                    if (
+                        not self.unloading
+                        and self._configured_destination() == destination
+                        and await self._upload_headers() == headers
+                    ):
+                        return results
+                    return ["unknown"] * len(metadata)
+                await self._check_capabilities(destination)
+                if not self._availability_supported:
+                    return ["unknown"] * len(metadata)
+                if self.unloading or self._configured_destination() != destination:
+                    return ["unknown"] * len(metadata)
+                statuses = await self._request_availability(
+                    destination, headers, [items[index] for index in missing]
+                )
+                if (
+                    self.unloading
+                    or self._configured_destination() != destination
+                    or await self._upload_headers() != headers
+                ):
+                    return ["unknown"] * len(metadata)
+                for index, status in zip(missing, statuses, strict=True):
+                    results[positions[index]] = status
+                await asyncio.gather(
+                    *(
+                        self.mass.cache.set(
+                            keys[index],
+                            status,
+                            provider=self.domain,
+                            expiration=300 if status == "full" else 60,
+                        )
+                        for index, status in zip(missing, statuses, strict=True)
+                    )
+                )
+                if (
+                    self.unloading
+                    or self._configured_destination() != destination
+                    or await self._upload_headers() != headers
+                ):
+                    return ["unknown"] * len(metadata)
+        except UploadDeferred as err:
+            self._availability_retry_at = time.monotonic() + err.retry_seconds
+            self.logger.warning("Fingerprint availability check failed: HTTP %s", err.status)
+            return ["unknown"] * len(metadata)
+        except (
+            InvalidDataError,
+            TimeoutError,
+            aiohttp.ClientError,
+            ValueError,
+            TypeError,
+            UnicodeError,
+        ) as err:
+            self.logger.warning("Fingerprint availability check failed: %s", err)
+        return results
+
+    @staticmethod
+    def _availability_identity(source: Any) -> dict[str, Any] | None:
+        if not isinstance(source, dict):
+            return None
+        mbid = source.get("recording_mbid")
+        isrc = source.get("isrc")
+        if mbid and not isinstance(mbid, str):
+            return None
+        try:
+            mbid = str(UUID(mbid)) if isinstance(mbid, str) else None
+        except ValueError:
+            return None
+        if not isinstance(isrc, str) or not re.fullmatch(
+            r"[A-Za-z]{2}[A-Za-z0-9]{3}[0-9]{7}", isrc
+        ):
+            if isrc:
+                return None
+            isrc = None
+        if not mbid and not isrc:
+            return None
+        title, artists, duration, album = (
+            source.get(key) for key in ("title", "artists", "duration", "album")
+        )
+        if (
+            not isinstance(duration, (int, float))
+            or isinstance(duration, bool)
+            or not math.isfinite(duration)
+            or not 0 < duration <= MAX_DURATION
+        ):
+            duration = None
+        if (
+            (isinstance(title, str) and len(title) > 500)
+            or (isinstance(album, str) and len(album) > 500)
+            or (
+                isinstance(artists, list)
+                and (len(artists) > 30 or any(isinstance(x, str) and len(x) > 500 for x in artists))
+            )
+        ):
+            return None
+        item = {
+            "format_id": FORMAT_ID,
+            "recording_mbid": mbid,
+            "isrc": isrc,
+            "title": title if isinstance(title, str) else None,
+            "album": album if isinstance(album, str) else None,
+            "artists": [x for x in artists if isinstance(x, str)]
+            if isinstance(artists, list)
+            else [],
+            "duration": duration,
+        }
+        return item if len(json.dumps(item).encode()) <= 1000 else None
+
+    async def _request_availability(
+        self, destination: str, headers: dict[str, str], items: list[dict[str, Any]]
+    ) -> list[str]:
+        payload = {
+            "version": 1,
+            "items": [{**item, "index": number} for number, item in enumerate(items)],
+        }
+        await self._pace_request()
+        if (
+            self.unloading
+            or self._configured_destination() != destination
+            or await self._upload_headers() != headers
+        ):
+            raise InvalidDataError("Availability credentials or destination changed")
+        async with self.mass.http_session.post(
+            destination.rsplit("/", 1)[0] + "/availability",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
+        ) as response:
+            if response.status == 429 or response.status >= 500:
+                raise UploadDeferred(response.status, self._retry_delay(response.headers))
+            if response.status != 200:
+                raise InvalidDataError(f"HTTP {response.status}")
+            try:
+                raw = await response.content.readexactly(32769)
+            except asyncio.IncompleteReadError as err:
+                raw = err.partial
+            if len(raw) > 32768:
+                raise InvalidDataError("Availability response exceeds the size limit")
+            data = json.loads(raw)
+        if (
+            not isinstance(data, dict)
+            or set(data) != {"version", "items"}
+            or type(data["version"]) is not int
+            or data["version"] != 1
+            or not isinstance(data["items"], list)
+            or len(data["items"]) != len(items)
+        ):
+            raise InvalidDataError("Invalid availability response")
+        statuses: list[str] = []
+        for number, entry in enumerate(data["items"]):
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"index", "status", "recording_mbid"}
+                or type(entry["index"]) is not int
+                or entry["index"] != number
+                or entry["status"] not in ("full", "partial", "unknown")
+                or (entry["status"] != "unknown" and not isinstance(entry["recording_mbid"], str))
+                or (entry["status"] == "unknown" and entry["recording_mbid"] is not None)
+            ):
+                raise InvalidDataError("Invalid availability result")
+            if entry["recording_mbid"] is not None:
+                resolved = str(UUID(entry["recording_mbid"]))
+                if items[number]["recording_mbid"] and items[number]["recording_mbid"] != resolved:
+                    raise InvalidDataError("Availability recording identifier mismatch")
+            statuses.append(entry["status"])
+        return statuses
 
     async def _pace_request(self) -> None:
         """Space outbound requests on the serialized upload path at least one second apart."""
         if (delay := self._next_request_at - time.monotonic()) > 0:
             await asyncio.sleep(delay)
         self._next_request_at = time.monotonic() + 1
+
+    def _retry_delay(self, headers: Any) -> int:
+        value = headers.get("Retry-After", "")
+        try:
+            if value.isdigit():
+                return max(RETRY_SECONDS, min(int(value), 86400))
+            if value:
+                seconds = parsedate_to_datetime(value).timestamp() - time.time()
+                return max(RETRY_SECONDS, min(math.ceil(seconds), 86400))
+        except ValueError, TypeError, OverflowError:
+            self.logger.warning("Fingerprint server returned invalid Retry-After")
+        return RETRY_SECONDS
 
     async def _upload_headers(self) -> dict[str, str]:
         application_key = self.config.get_value(CONF_APPLICATION_KEY)
@@ -571,18 +833,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             allow_redirects=False,
         ) as response:
             if response.status == 429 or response.status >= 500:
-                retry_delay = RETRY_SECONDS
-                value = response.headers.get("Retry-After", "")
-                if value.isdigit():
-                    retry_delay = max(RETRY_SECONDS, min(int(value), 86400))
-                elif value:
-                    try:
-                        seconds = parsedate_to_datetime(value).timestamp() - time.time()
-                    except ValueError, TypeError, OverflowError:
-                        self.logger.warning("Fingerprint server returned invalid Retry-After")
-                    else:
-                        retry_delay = max(RETRY_SECONDS, min(math.ceil(seconds), 86400))
-                raise UploadDeferred(response.status, retry_delay)
+                raise UploadDeferred(response.status, self._retry_delay(response.headers))
             if response.status not in (200, 202):
                 raise InvalidDataError(
                     f"HTTP {response.status}; check recognition server, API key and application token"

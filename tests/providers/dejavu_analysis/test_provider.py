@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from collections.abc import AsyncGenerator
+from email.utils import formatdate
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -354,6 +356,265 @@ def _response(provider: DejavuAnalysisProvider, status: int, document: dict[str,
     context.__aenter__ = AsyncMock(return_value=response)
     context.__aexit__ = AsyncMock(return_value=False)
     provider.mass.http_session.post.return_value = context
+
+
+@pytest.mark.parametrize("status", ["full", "partial", "unknown"])
+async def test_availability_before_sampler(status: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only verified full coverage skips the sampler."""
+    provider = await _provider(upload=True, application_key="application")
+    assert isinstance(provider.mass, MagicMock)
+    destination = provider._configured_destination()
+    provider._capability_destination = destination
+    provider._availability_supported = True
+    track = _repair_track()
+    provider.mass.streams.audio_analysis.get_analysis_track = AsyncMock(return_value=track)
+    _response(
+        provider,
+        200,
+        {
+            "version": 1,
+            "items": [
+                {
+                    "index": 0,
+                    "status": status,
+                    "recording_mbid": (
+                        None if status == "unknown" else "e9c2a2a3-4f4b-4b6a-9c31-3a8b2f3c7f10"
+                    ),
+                }
+            ],
+        },
+    )
+    sampler = MagicMock()
+    monkeypatch.setattr("music_assistant.providers.dejavu_analysis.WindowSampler", sampler)
+    stream = _stream()
+    assert await provider.start_analysis("session", stream, stream.audio_format) is (
+        status != "full"
+    )
+    assert sampler.call_count == (0 if status == "full" else 1)
+    request = provider.mass.http_session.post.call_args
+    assert request.kwargs["headers"]["X-API-Key"] == "test-key"
+    assert request.kwargs["headers"]["X-Application-Key"] == "application"
+    assert provider.analysis_version == 2
+
+
+@pytest.mark.parametrize(
+    ("http_status", "body"),
+    [
+        (401, {}),
+        (429, {}),
+        (200, {"version": 1, "items": []}),
+        (200, {"version": 2, "items": []}),
+        (200, {"version": 1, "items": [{"index": 1, "status": "full", "recording_mbid": None}]}),
+        (200, {"version": 1, "items": [{"index": 0, "status": "full", "recording_mbid": "bad"}]}),
+    ],
+)
+async def test_availability_failure_continues_analysis(
+    http_status: int, body: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failures are logged and do not prevent analysis."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    provider._capability_destination = provider._configured_destination()
+    provider._availability_supported = True
+    provider.mass.streams.audio_analysis.get_analysis_track = AsyncMock(
+        return_value=_repair_track()
+    )
+    _response(provider, http_status, body)
+    stream = _stream()
+    assert await provider.start_analysis("session", stream, stream.audio_format)
+    assert "availability check failed" in caplog.text
+
+
+@pytest.mark.parametrize(("http_status", "date_header"), [(429, False), (503, True)])
+async def test_availability_pacing_and_cooldown_allow_distinct_tracks(
+    http_status: int,
+    date_header: bool,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rate limits pause preflights, not PCM analysis or normal uploads."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    provider._capability_destination = provider._configured_destination()
+    provider._availability_supported = True
+    tracks = [_repair_track(), _repair_track(), _repair_track()]
+    tracks[1].name = "Another recording"
+    tracks[2].name = "Later recording"
+    provider.mass.streams.audio_analysis.get_analysis_track = AsyncMock(side_effect=tracks)
+    _response(provider, http_status, {})
+    response = provider.mass.http_session.post.return_value.__aenter__.return_value
+    response.headers = {
+        "Retry-After": formatdate(time.time() + 3600, usegmt=True) if date_header else "3600"
+    }
+    pace = AsyncMock()
+    monkeypatch.setattr(provider, "_pace_request", pace)
+    stream = _stream()
+    assert await provider.start_analysis("first", stream, stream.audio_format)
+    assert 3598 <= provider._availability_retry_at - time.monotonic() <= 3600
+    assert provider._retry_at == 0
+    assert await provider.start_analysis("second", stream, stream.audio_format)
+    assert provider.mass.http_session.post.call_count == 1
+    pace.assert_awaited_once()
+    assert "availability check failed" in caplog.text
+    provider._availability_retry_at = 0
+    assert await provider.start_analysis("third", stream, stream.audio_format)
+    assert provider.mass.http_session.post.call_count == 2
+    assert pace.await_count == 2
+
+
+async def test_retry_after_minimum_invalid_and_ceiling(caplog: pytest.LogCaptureFixture) -> None:
+    """Retry headers retain the existing safe limits and invalid-value logging."""
+    provider = await _provider(upload=True)
+    assert provider._retry_delay({"Retry-After": "1"}) == 300
+    assert provider._retry_delay({"Retry-After": "999999"}) == 86400
+    assert provider._retry_delay({"Retry-After": "invalid"}) == 300
+    assert "invalid Retry-After" in caplog.text
+
+
+async def test_recovery_checks_batch_without_accepting_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovered full references are skipped without marking them accepted."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    destination = provider._configured_destination()
+    assert destination
+    provider._capability_destination = destination
+    provider._availability_supported = True
+    metadata = {**provider._track_metadata(_repair_track()), "duration": 5}
+    extras = [
+        {"upload_destination": destination, "dejavu": {"metadata": metadata}} for _ in range(3)
+    ]
+    _response(
+        provider,
+        200,
+        {
+            "version": 1,
+            "items": [
+                {
+                    "index": i,
+                    "status": status,
+                    "recording_mbid": (
+                        None if status == "unknown" else "e9c2a2a3-4f4b-4b6a-9c31-3a8b2f3c7f10"
+                    ),
+                }
+                for i, status in enumerate(("full", "partial", "unknown"))
+            ],
+        },
+    )
+    upload = AsyncMock()
+    monkeypatch.setattr(provider, "_upload", upload)
+    await provider._upload_recovered(extras, destination)
+    assert provider.mass.http_session.post.call_count == 1
+    assert upload.await_count == 2
+    assert len(provider.mass.http_session.post.call_args.kwargs["json"]["items"]) == 3
+    assert all(
+        call.args[1] != {"accepted": True} for call in provider.mass.cache.set.await_args_list
+    )
+
+
+async def test_availability_cache_is_scoped_to_consent_destination_and_credentials() -> None:
+    """Cached availability never crosses a destination or credential boundary."""
+    provider = await _provider(upload=True, application_key="application")
+    assert isinstance(provider.mass, MagicMock)
+    assert isinstance(provider.config, MagicMock)
+    values = {
+        CONF_UPLOAD: True,
+        CONF_URL: "http://localhost:8097",
+        CONF_KEY: "first",
+        CONF_APPLICATION_KEY: "application",
+    }
+    provider.config.get_value.side_effect = lambda key, *_args: values.get(key)
+    cache: dict[str, Any] = {}
+    provider.mass.cache.get.side_effect = lambda key, **_kwargs: cache.get(key)
+    provider.mass.cache.set.side_effect = lambda key, value, **_kwargs: cache.update({key: value})
+    destination = provider._configured_destination()
+    assert destination
+    provider._capability_destination = destination
+    provider._availability_supported = True
+    _response(
+        provider,
+        200,
+        {
+            "version": 1,
+            "items": [
+                {
+                    "index": 0,
+                    "status": "full",
+                    "recording_mbid": "e9c2a2a3-4f4b-4b6a-9c31-3a8b2f3c7f10",
+                }
+            ],
+        },
+    )
+    metadata = {**provider._track_metadata(_repair_track()), "duration": 5}
+    assert await provider._availability(destination, [metadata]) == ["full"]
+    assert await provider._availability(destination, [metadata]) == ["full"]
+    assert provider.mass.http_session.post.call_count == 1
+    values[CONF_KEY] = "second"
+    assert await provider._availability(destination, [metadata]) == ["full"]
+    assert provider.mass.http_session.post.call_count == 2
+    values[CONF_URL] = "http://localhost:8098"
+    new_destination = provider._configured_destination()
+    assert new_destination
+    provider._capability_destination = new_destination
+    assert await provider._availability(new_destination, [metadata]) == ["full"]
+    assert provider.mass.http_session.post.call_count == 3
+    values[CONF_UPLOAD] = False
+    assert await provider._availability(new_destination, [metadata]) == ["unknown"]
+    assert provider.mass.http_session.post.call_count == 3
+
+
+async def test_old_server_without_availability_is_optional() -> None:
+    """An older compatible receiver does not cause a failed preflight."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    destination = provider._configured_destination()
+    assert destination
+    metadata = {**provider._track_metadata(_repair_track()), "duration": 5}
+    assert await provider._availability(destination, [metadata]) == ["unknown"]
+    provider.mass.http_session.post.assert_not_called()
+    assert not provider._upload_blocked
+
+
+async def test_recovery_pass_batches_and_retains_full_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovery pass checks eligible rows together without replacing complete headers."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    extra["dejavu"]["metadata"] = {**provider._track_metadata(_repair_track()), "duration": 5}
+    header, _ = encode(AudioAnalysisData(extra_data=extra))
+
+    async def rows(_domain: str) -> AsyncGenerator[tuple[dict[str, Any], Track]]:
+        for index in range(3):
+            yield {"id": index, "header": header.encode()}, _repair_track()
+
+    controller = provider.mass.streams.audio_analysis
+    controller.iter_analysis_rows_with_library_tracks.side_effect = rows
+    controller.replace_analysis_header = AsyncMock()
+    availability = AsyncMock(return_value=["full", "partial", "unknown"])
+    upload = AsyncMock()
+    monkeypatch.setattr(provider, "_availability", availability)
+    monkeypatch.setattr(provider, "_upload", upload)
+    await provider._recover_uploads()
+    assert availability.await_args is not None
+    assert len(availability.await_args.args[1]) == 3
+    assert upload.await_count == 2
+    controller.replace_analysis_header.assert_not_awaited()
+
+
+async def test_availability_propagates_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cancelled preflight does not silently continue analysis."""
+    provider = await _provider(upload=True)
+    destination = provider._configured_destination()
+    assert destination
+    monkeypatch.setattr(
+        provider, "_check_capabilities", AsyncMock(side_effect=asyncio.CancelledError)
+    )
+    metadata = {**provider._track_metadata(_repair_track()), "duration": 5}
+    with pytest.raises(asyncio.CancelledError):
+        await provider._availability(destination, [metadata])
 
 
 @pytest.mark.parametrize("ack_status", ["queued", "processed", "pending_metadata"])
