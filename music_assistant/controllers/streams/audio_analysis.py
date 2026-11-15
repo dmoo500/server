@@ -26,6 +26,7 @@ from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import ContentType, MediaType, ProviderType, StreamType
 from music_assistant_models.errors import ProviderUnavailableError
+from music_assistant_models.media_items import Track
 
 from music_assistant.constants import (
     CONF_BACKGROUND_SCAN_CONCURRENCY,
@@ -113,7 +114,6 @@ if TYPE_CHECKING:
         AudioFormat,
         AudioMetadata,
         ProviderMapping,
-        Track,
     )
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -991,13 +991,95 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
             f"SELECT id, media_type, item_id, provider, aa_provider_domain, "
             f"CAST(header AS BLOB) AS header, payload, analysis_version, timestamp_created "
             f"FROM {AA_TABLE_ANALYSIS} "
-            f"WHERE aa_provider_domain = :aa_provider_domain AND media_type = :media_type"
+            f"WHERE aa_provider_domain = :aa_provider_domain AND media_type = :media_type ORDER BY id"
         )
         async for row in self.database.iter_rows_from_query(
             query,
             {"aa_provider_domain": aa_provider_domain, "media_type": media_type.value},
         ):
             yield row
+
+    async def get_analysis_track(self, streamdetails: StreamDetails) -> Track | None:
+        """Resolve existing metadata for the exact analyzed source, without fetching remotely."""
+        if streamdetails.provider == "library":
+            return await self.mass.music.tracks.get_library_item(streamdetails.item_id)
+        track = await self.mass.music.tracks.get_library_item_by_prov_id(
+            streamdetails.item_id, streamdetails.provider
+        )
+        if track is not None:
+            return track
+        if not streamdetails.queue_id:
+            return None
+        offset = 0
+        while items := self.mass.player_queues.items(streamdetails.queue_id, 100, offset):
+            for item in items:
+                if (
+                    item.streamdetails is not None
+                    and item.streamdetails.uri == streamdetails.uri
+                    and isinstance(item.media_item, Track)
+                ):
+                    return item.media_item
+            offset += len(items)
+        return None
+
+    async def iter_analysis_rows_with_library_tracks(
+        self, provider_domain: str
+    ) -> AsyncGenerator[tuple[Mapping[str, Any], Track | None]]:
+        """Yield stored analyses with unambiguous existing library matches in bounded batches."""
+        tracks_by_key: dict[tuple[str, str], Track | None] = {}
+        last_batch_id = -1
+        async for row in self.iter_audio_analysis_rows(provider_domain):
+            if row["id"] > last_batch_id:
+                keys = await self.database.get_rows_from_query(
+                    f"SELECT id,item_id,provider FROM {AA_TABLE_ANALYSIS} "
+                    "WHERE aa_provider_domain=:domain AND media_type='track' AND id>=:id ORDER BY id",
+                    {"domain": provider_domain, "id": row["id"]},
+                    limit=25,
+                )
+                tracks_by_key = {}
+                last_batch_id = keys[-1]["id"] if keys else row["id"]
+                grouped: dict[str, list[str]] = defaultdict(list)
+                for key in keys:
+                    grouped[key["provider"]].append(key["item_id"])
+                for source, item_ids in grouped.items():
+                    offset = 0
+                    while tracks := await self.mass.music.tracks.get_library_items_by_prov_id(
+                        provider_instance_id_or_domain=source,
+                        provider_item_ids=item_ids,
+                        limit=100,
+                        offset=offset,
+                    ):
+                        for track in tracks:
+                            for mapping in track.provider_mappings:
+                                if (
+                                    source in (mapping.provider_domain, mapping.provider_instance)
+                                    and mapping.item_id in item_ids
+                                ):
+                                    mapping_key = (source, mapping.item_id)
+                                    if (
+                                        mapping_key in tracks_by_key
+                                        and tracks_by_key[mapping_key] != track
+                                    ):
+                                        tracks_by_key[mapping_key] = None
+                                    else:
+                                        tracks_by_key.setdefault(mapping_key, track)
+                        offset += len(tracks)
+            yield row, tracks_by_key.get((row["provider"], row["item_id"]))
+
+    async def replace_analysis_header(
+        self, row_id: int, provider_domain: str, old_header: bytes, new_header: str
+    ) -> bool:
+        """Persist a provider header only if the stored analysis has not changed."""
+        self._require_database()
+        cursor = await self.database.execute(
+            f"UPDATE {AA_TABLE_ANALYSIS} SET header=:new "
+            "WHERE id=:id AND aa_provider_domain=:domain AND CAST(header AS BLOB)=:old",
+            {"id": row_id, "domain": provider_domain, "old": old_header, "new": new_header},
+        )
+        changed = bool(cursor.rowcount == 1)
+        await cursor.close()
+        await self.database.commit()
+        return changed
 
     async def iter_merged_audio_analysis_rows(
         self,

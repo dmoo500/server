@@ -6,13 +6,15 @@ import asyncio
 import hashlib
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 import aiohttp
-from music_assistant_fingerprint import (
+from audio_fingerprint import (
     FORMAT_ID,
     LEGACY_FORMAT_ID,
     MAX_DOCUMENT_BYTES,
@@ -21,11 +23,10 @@ from music_assistant_fingerprint import (
     SAMPLE_RATE,
     WindowSampler,
 )
-from music_assistant_fingerprint.codec import ENCODING_ID, decode_document, encode_document
+from audio_fingerprint.codec import ENCODING_ID, decode_document, encode_document
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
-from music_assistant_models.media_items import Track
 from yarl import URL
 
 from music_assistant.controllers.streams.audio_analysis_codec import decode_extra_data
@@ -35,7 +36,7 @@ from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.media_items import AudioFormat
+    from music_assistant_models.media_items import AudioFormat, Track
     from music_assistant_models.provider import ProviderManifest
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -175,37 +176,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         if destination:
             # Only existing library/queue metadata is consulted; this never fetches provider
             # audio or triggers online enrichment. Stream URLs and provider IDs are not submitted.
-            track: Track | None
-            if streamdetails.provider == "library":
-                track = await self.mass.music.tracks.get_library_item(streamdetails.item_id)
-            else:
-                track = await self.mass.music.tracks.get_library_item_by_prov_id(
-                    streamdetails.item_id, streamdetails.provider
-                )
-            if track is None and streamdetails.queue_id:
-                offset = 0
-                while items := self.mass.player_queues.items(streamdetails.queue_id, 100, offset):
-                    track = next(
-                        (
-                            item.media_item
-                            for item in items
-                            if item.streamdetails is not None
-                            and item.streamdetails.uri == streamdetails.uri
-                            and isinstance(item.media_item, Track)
-                        ),
-                        None,
-                    )
-                    if track is not None:
-                        break
-                    offset += len(items)
+            track = await self.mass.streams.audio_analysis.get_analysis_track(streamdetails)
             if track is not None:
-                metadata.update(
-                    title=track.name,
-                    artists=[artist.name for artist in track.artists],
-                    album=track.album.name if track.album else None,
-                    recording_mbid=track.mbid,
-                    isrc=track.get_external_id(ExternalID.ISRC),
-                )
+                metadata.update(self._track_metadata(track))
             elif streamdetails.stream_metadata is not None:
                 metadata.update(
                     title=streamdetails.stream_metadata.title,
@@ -214,13 +187,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     else [],
                     album=streamdetails.stream_metadata.album,
                 )
-            if (
-                not metadata.get("title")
-                or not metadata.get("artists")
-                or not metadata.get("album")
-            ):
+            if not self._metadata_complete(metadata):
                 self.logger.warning(
-                    "Fingerprint metadata lacks title, artist or album; the receiver must "
+                    "Fingerprint metadata lacks required fields or a recording identifier; the receiver must "
                     "hold this contribution pending metadata"
                 )
         self._data[session_id] = FingerprintSession(sampler, destination, metadata)
@@ -305,13 +274,47 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
     async def _recover_uploads(self) -> None:
         """Retry stored consent-eligible results, without reanalyzing tracks."""
         try:
-            async for row in self.mass.streams.audio_analysis.iter_audio_analysis_rows(self.domain):
+            async for (
+                row,
+                track,
+            ) in self.mass.streams.audio_analysis.iter_analysis_rows_with_library_tracks(
+                self.domain
+            ):
                 try:
                     extra = await self._run_offloaded(decode_extra_data, row["header"])
                 except (ValueError, UnicodeError) as err:
                     self.logger.warning("Cannot decode stored fingerprints: %s", err)
                     continue
                 if extra is not None:
+                    destination = self._configured_destination()
+                    if destination is None or extra.get("upload_destination") != destination:
+                        continue
+                    try:
+                        header = await self._run_offloaded(
+                            self._repair_header, row["header"], track
+                        )
+                    except (ValueError, TypeError, UnicodeError) as err:
+                        self.logger.warning("Cannot repair stored fingerprint metadata: %s", err)
+                        continue
+                    if header is not None:
+                        if not await self.mass.streams.audio_analysis.replace_analysis_header(
+                            row["id"], self.domain, row["header"], header
+                        ):
+                            self.logger.warning(
+                                "Fingerprint analysis changed during metadata repair; deferring upload"
+                            )
+                            continue
+                        extra = await self._run_offloaded(decode_extra_data, header)
+                        if extra is None:
+                            self.logger.error("Repaired fingerprint header cannot be decoded")
+                            continue
+                    document = extra.get("dejavu")
+                    if isinstance(document, dict) and isinstance(document.get("metadata"), dict):
+                        if not self._metadata_complete(document["metadata"]):
+                            self.logger.warning(
+                                "Stored fingerprint metadata remains incomplete; "
+                                "no complete identity-matched library metadata is available"
+                            )
                     await self._upload(extra)
                 if self._upload_blocked or self.unloading or self._retry_at > time.time():
                     return
@@ -469,6 +472,78 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 raise InvalidDataError("The fingerprint application token must be a string")
             headers["X-Application-Key"] = application_key
         return headers
+
+    @staticmethod
+    def _track_metadata(track: Track) -> dict[str, Any]:
+        return {
+            "title": track.name,
+            "artists": [artist.name for artist in track.artists],
+            "album": track.album.name if track.album else None,
+            "recording_mbid": track.mbid,
+            "isrc": track.get_external_id(ExternalID.ISRC),
+        }
+
+    @staticmethod
+    def _metadata_complete(metadata: dict[str, Any]) -> bool:
+        duration = metadata.get("duration")
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not 0 < duration <= MAX_DURATION
+        ):
+            return False
+        if any(
+            not isinstance(metadata.get(key), str) or not metadata[key].strip()
+            for key in ("title", "album")
+        ):
+            return False
+        artists = metadata.get("artists")
+        if not isinstance(artists, list) or not any(
+            isinstance(artist, str) and artist.strip() for artist in artists
+        ):
+            return False
+        isrc = metadata.get("isrc")
+        if isinstance(isrc, str) and re.fullmatch(r"[A-Za-z]{2}[A-Za-z0-9]{3}[0-9]{7}", isrc):
+            return True
+        mbid = metadata.get("recording_mbid")
+        if isinstance(mbid, str):
+            try:
+                UUID(mbid)
+            except ValueError:
+                return False
+            return True
+        return False
+
+    @classmethod
+    def _repair_header(cls, raw: bytes, track: Track | None) -> str | None:
+        header = json.loads(raw)
+        if not isinstance(header, dict):
+            raise TypeError("Invalid analysis header")
+        extra = header.get("extra_data")
+        if not isinstance(extra, dict):
+            return None
+        document = extra.get("dejavu")
+        if not isinstance(document, dict) or not isinstance(document.get("metadata"), dict):
+            return None
+        metadata = document["metadata"]
+        if cls._metadata_complete(metadata):
+            return None
+        if track is None:
+            return None
+        changed = False
+        for key, value in cls._track_metadata(track).items():
+            existing = metadata.get(key)
+            missing = (
+                existing is None
+                or existing in ("", [])
+                or (isinstance(existing, str) and not existing.strip())
+            )
+            if missing and value:
+                metadata[key] = value
+                changed = True
+        if not changed:
+            return None
+        return json.dumps(header, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
     @staticmethod
     def _compact_header(raw: str | bytes) -> str | None:

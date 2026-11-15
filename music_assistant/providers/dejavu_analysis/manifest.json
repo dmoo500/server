@@ -5,7 +5,7 @@
   "name": "Dejavu Fingerprints",
   "description": "Creates landmark fingerprints during playback for an opt-in song recognition service.",
   "codeowners": ["@dmoo500"],
-  "requirements": ["music-assistant-fingerprint @ git+https://github.com/dmoo500/audio-fingerprint.git@cbfa2fc0faaa6c986654df2ab14ce1dd1bfc6e55"],
+  "requirements": ["audio-fingerprint @ git+https://github.com/dmoo500/audio-fingerprint.git@e04a9442fee7c7eb1d77eb621c5c3e0c3ce2fead"],
   "documentation": "https://github.com/dmoo500/audio-fingerprint-server",
   "multi_instance": false,
   "builtin": false,

@@ -87,6 +87,103 @@ async def _table_names(db: DatabaseConnection) -> set[str]:
     return {r["name"] for r in rows}
 
 
+async def test_provider_header_replacement_is_scoped_and_preserves_payload(
+    ctrl: AudioAnalysisController,
+) -> None:
+    """A header repair preserves row data and refuses stale or wrong-domain writes."""
+    await ctrl.setup_database()
+    await ctrl.database.insert(
+        AA_TABLE_ANALYSIS,
+        {
+            "media_type": "track",
+            "item_id": "t1",
+            "provider": "source",
+            "aa_provider_domain": "pilot",
+            "header": "old",
+            "payload": b"untouched",
+            "analysis_version": 2,
+            "timestamp_created": 123,
+        },
+    )
+    row = await ctrl.database.get_row(AA_TABLE_ANALYSIS, {"item_id": "t1"})
+    assert row is not None
+    assert not await ctrl.replace_analysis_header(row["id"], "other", b"old", "new")
+    assert not await ctrl.replace_analysis_header(row["id"], "pilot", b"stale", "new")
+    assert await ctrl.replace_analysis_header(row["id"], "pilot", b"old", "new")
+    updated = await ctrl.database.get_row(AA_TABLE_ANALYSIS, {"item_id": "t1"})
+    assert updated is not None
+    assert dict(updated) == {**dict(row), "header": "new"}
+    assert not await ctrl.replace_analysis_header(row["id"], "pilot", b"old", "stale")
+
+
+async def test_recovery_library_resolution_batches_and_rejects_ambiguous_mappings(
+    ctrl: AudioAnalysisController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery resolves bounded identity batches without assigning ambiguous library tracks."""
+    await ctrl.setup_database()
+    for number in range(26):
+        await ctrl.database.insert(
+            AA_TABLE_ANALYSIS,
+            {
+                "media_type": "track",
+                "item_id": str(number),
+                "provider": "source",
+                "aa_provider_domain": "pilot",
+                "header": "{}",
+                "payload": b"",
+            },
+        )
+
+    async def lookup(
+        provider_instance_id_or_domain: str, provider_item_ids: list[str], limit: int, offset: int
+    ) -> list[Track]:
+        assert provider_instance_id_or_domain == "source"
+        assert limit == 100
+        assert len(provider_item_ids) <= 25
+        if offset:
+            return []
+        tracks = [
+            Track(
+                item_id=item_id,
+                provider="library",
+                name="Library track",
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=item_id,
+                        provider_domain="source",
+                        provider_instance="source-instance",
+                    )
+                },
+            )
+            for item_id in provider_item_ids
+        ]
+        if "0" in provider_item_ids:
+            tracks.append(
+                Track(
+                    item_id="ambiguous",
+                    provider="library",
+                    name="Different track",
+                    provider_mappings={
+                        ProviderMapping(
+                            item_id="0",
+                            provider_domain="source",
+                            provider_instance="source-instance",
+                        )
+                    },
+                )
+            )
+        return tracks
+
+    lookup_mock = AsyncMock(side_effect=lookup)
+    monkeypatch.setattr(ctrl.mass.music.tracks, "get_library_items_by_prov_id", lookup_mock)
+    results = [item async for item in ctrl.iter_analysis_rows_with_library_tracks("pilot")]
+    assert len(results) == 26
+    assert results[0][1] is None
+    assert all(track is not None and row["item_id"] == track.item_id for row, track in results[1:])
+    assert lookup_mock.await_count == 4
+
+
 async def test_header_migration_retries_partial_failure_without_reset(
     ctrl: AudioAnalysisController, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

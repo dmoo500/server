@@ -201,7 +201,7 @@ class ControlApi:
         return web.json_response(result)
 
     async def _handle_fingerprints(self, request: web.Request) -> web.Response:
-        from music_assistant_fingerprint.codec import decode_document  # noqa: PLC0415
+        from audio_fingerprint.codec import decode_document  # noqa: PLC0415
 
         from music_assistant.controllers.streams.audio_analysis_codec import (  # noqa: PLC0415
             decode_extra_data,

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import numpy as np
 import pytest
 from aiohttp import ClientSession, web
-from music_assistant_fingerprint.codec import ENCODING_ID, decode_document
+from audio_fingerprint.codec import ENCODING_ID, decode_document
 from music_assistant_models.enums import ConfigEntryType, ContentType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Album, Artist, AudioFormat, Track
@@ -21,6 +21,7 @@ from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 from music_assistant_models.unique_list import UniqueList
 
+from music_assistant.controllers.streams.audio_analysis import AudioAnalysisController
 from music_assistant.controllers.streams.audio_analysis_codec import encode
 from music_assistant.controllers.streams.audio_analysis_database import (
     AudioAnalysisDatabaseMixin,
@@ -83,6 +84,13 @@ async def _provider(
     context.__aexit__ = AsyncMock(return_value=False)
     mass.http_session.get.return_value = context
     mass.streams.audio_analysis.migrate_provider_headers = AsyncMock(return_value=True)
+    controller = mass.streams.audio_analysis
+    controller.mass = mass
+
+    async def resolve(stream: StreamDetails) -> Track | None:
+        return await AudioAnalysisController.get_analysis_track(controller, stream)
+
+    controller.get_analysis_track = AsyncMock(side_effect=resolve)
     return provider
 
 
@@ -181,6 +189,108 @@ async def test_queue_fallback_does_not_use_a_different_track() -> None:
     provider.mass.player_queues.items.side_effect = [[other], []]
     assert await provider.start_analysis("session", stream, stream.audio_format)
     assert provider._data["session"].metadata == {"duration": 5}
+
+
+def _repair_track() -> Track:
+    return Track(
+        item_id="track",
+        provider="library",
+        name="Recovered title",
+        provider_mappings=set(),
+        artists=UniqueList(
+            [Artist(item_id="artist", provider="library", name="Artist", provider_mappings=set())]
+        ),
+        album=Album(item_id="album", provider="library", name="Album", provider_mappings=set()),
+        external_ids={(ExternalID.ISRC, "USAAA2600001")},
+    )
+
+
+@pytest.mark.parametrize("duration", [None, True, 0, -1, float("nan"), float("inf")])
+def test_metadata_completeness_requires_valid_actual_duration(duration: Any) -> None:
+    """Recording identifiers and descriptions cannot substitute for a valid analyzed duration."""
+    metadata = DejavuAnalysisProvider._track_metadata(_repair_track())
+    metadata["duration"] = duration
+    assert not DejavuAnalysisProvider._metadata_complete(metadata)
+
+
+async def test_recovery_repairs_before_cached_acceptance_and_preserves_acoustics() -> None:
+    """An accepted duration-only result gains library metadata without reanalysis or new consent."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    extra["dejavu"]["metadata"] = {"duration": 5}
+    header, _ = encode(AudioAnalysisData(extra_data=extra))
+    old_doc = decode_document(extra["dejavu"])
+    old_id = hashlib.sha256(
+        json.dumps(old_doc, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    track = _repair_track()
+    repaired = provider._repair_header(header.encode(), track)
+    assert repaired is not None
+    repaired_extra = json.loads(repaired)["extra_data"]
+    decoded = decode_document(repaired_extra["dejavu"])
+    new_id = hashlib.sha256(
+        json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert new_id != old_id
+    assert decoded["fingerprints"] == old_doc["fingerprints"]
+    assert decoded["windows"] == old_doc["windows"]
+    assert decoded["metadata"]["duration"] == 5
+    assert repaired_extra["upload_destination"] == extra["upload_destination"]
+
+    async def rows(_domain: str) -> AsyncGenerator[tuple[dict[str, Any], Track]]:
+        yield {"id": 1, "header": header.encode()}, track
+
+    provider.mass.streams.audio_analysis.iter_analysis_rows_with_library_tracks.side_effect = rows
+    provider.mass.streams.audio_analysis.replace_analysis_header = AsyncMock(return_value=True)
+    old_cache_key = hashlib.sha256(f"{extra['upload_destination']}|{old_id}".encode()).hexdigest()
+
+    async def cached(key: str, **_kwargs: Any) -> dict[str, bool] | None:
+        return {"accepted": True} if key == old_cache_key else None
+
+    provider.mass.cache.get.side_effect = cached
+    _response(provider, 202, {"submission_id": new_id, "status": "queued"})
+    await provider._recover_uploads()
+    provider.mass.streams.audio_analysis.replace_analysis_header.assert_awaited_once()
+    provider.mass.http_session.post.assert_called_once()
+    assert provider._repair_header(repaired.encode(), track) is None
+
+
+@pytest.mark.parametrize(("private", "conflict"), [(True, False), (False, True)])
+async def test_metadata_repair_never_uploads_private_or_concurrently_changed_results(
+    private: bool, conflict: bool
+) -> None:
+    """Repair cannot grant consent or overwrite a concurrently replaced analysis."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    extra["dejavu"]["metadata"] = {"duration": 5}
+    if private:
+        extra["upload_destination"] = None
+    header, _ = encode(AudioAnalysisData(extra_data=extra))
+
+    async def rows(_domain: str) -> AsyncGenerator[tuple[dict[str, Any], Track]]:
+        yield {"id": 1, "header": header.encode()}, _repair_track()
+
+    controller = provider.mass.streams.audio_analysis
+    controller.iter_analysis_rows_with_library_tracks.side_effect = rows
+    controller.replace_analysis_header = AsyncMock(return_value=not conflict)
+    await provider._recover_uploads()
+    provider.mass.http_session.post.assert_not_called()
+    if private:
+        controller.replace_analysis_header.assert_not_awaited()
+
+
+async def test_repair_preserves_nonempty_metadata_and_unmatched_results() -> None:
+    """Existing descriptions are not replaced and unmatched rows are not guessed."""
+    provider = await _provider(upload=True)
+    extra = await _envelope(provider)
+    extra["dejavu"]["metadata"] = {"duration": 5, "title": "Original title"}
+    header, _ = encode(AudioAnalysisData(extra_data=extra))
+    assert provider._repair_header(header.encode(), None) is None
+    repaired = provider._repair_header(header.encode(), _repair_track())
+    assert repaired is not None
+    assert json.loads(repaired)["extra_data"]["dejavu"]["metadata"]["title"] == "Original title"
 
 
 async def test_incomplete_window_cannot_be_finalized() -> None:
@@ -339,10 +449,10 @@ async def test_recovery_uploads_current_analysis_without_reanalyzing(
     extra = await _envelope(provider)
     header, _ = encode(AudioAnalysisData(extra_data=extra))
 
-    async def rows(_domain: str) -> AsyncGenerator[dict[str, bytes]]:
-        yield {"header": header.encode("utf-8")}
+    async def rows(_domain: str) -> AsyncGenerator[tuple[dict[str, bytes], None]]:
+        yield {"header": header.encode("utf-8")}, None
 
-    provider.mass.streams.audio_analysis.iter_audio_analysis_rows.side_effect = rows
+    provider.mass.streams.audio_analysis.iter_analysis_rows_with_library_tracks.side_effect = rows
     provider.mass.streams.audio_analysis.get_audio_analysis_version.return_value = 2
     stream = _stream()
     assert not await provider.start_analysis("current", stream, stream.audio_format)
