@@ -471,12 +471,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     f"Fingerprint capability check returned HTTP {response.status}; "
                     "update the receiver and gateway before enabling compact uploads"
                 )
-            try:
-                raw = await response.content.readexactly(4097)
-            except asyncio.IncompleteReadError as err:
-                raw = err.partial
-            if len(raw) > 4096:
-                raise InvalidDataError("Fingerprint capabilities exceed the size limit")
+            raw = await self._read_response(
+                response, 4096, "Fingerprint capabilities exceed the size limit"
+            )
             try:
                 capabilities = json.loads(raw)
             except (ValueError, UnicodeError) as err:
@@ -668,12 +665,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 raise UploadDeferred(response.status, self._retry_delay(response.headers))
             if response.status != 200:
                 raise InvalidDataError(f"HTTP {response.status}")
-            try:
-                raw = await response.content.readexactly(32769)
-            except asyncio.IncompleteReadError as err:
-                raw = err.partial
-            if len(raw) > 32768:
-                raise InvalidDataError("Availability response exceeds the size limit")
+            raw = await self._read_response(
+                response, 32768, "Availability response exceeds the size limit"
+            )
             data = json.loads(raw)
         if (
             not isinstance(data, dict)
@@ -702,6 +696,19 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     raise InvalidDataError("Availability recording identifier mismatch")
             statuses.append(entry["status"])
         return statuses
+
+    @staticmethod
+    async def _read_response(
+        response: aiohttp.ClientResponse, limit: int, oversized_message: str
+    ) -> bytes:
+        """Read a response body up to its byte limit."""
+        try:
+            raw = await response.content.readexactly(limit + 1)
+        except asyncio.IncompleteReadError as err:
+            raw = err.partial
+        if len(raw) > limit:
+            raise InvalidDataError(oversized_message)
+        return raw
 
     async def _pace_request(self) -> None:
         """Space outbound requests on the serialized upload path at least one second apart."""
@@ -838,12 +845,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 raise InvalidDataError(
                     f"HTTP {response.status}; check recognition server, API key and application token"
                 )
-            try:
-                raw_ack = await response.content.readexactly(4097)
-            except asyncio.IncompleteReadError as err:
-                raw_ack = err.partial
-            if len(raw_ack) > 4096:
-                raise InvalidDataError("Fingerprint acknowledgement exceeds the size limit")
+            raw_ack = await self._read_response(
+                response, 4096, "Fingerprint acknowledgement exceeds the size limit"
+            )
             try:
                 acknowledgement = json.loads(raw_ack)
             except (ValueError, UnicodeError) as err:

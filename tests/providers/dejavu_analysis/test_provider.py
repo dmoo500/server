@@ -358,6 +358,24 @@ def _response(provider: DejavuAnalysisProvider, status: int, document: dict[str,
     provider.mass.http_session.post.return_value = context
 
 
+@pytest.mark.parametrize("limit", [4096, 32768])
+@pytest.mark.parametrize("size_delta", [-1, 0, 1])
+async def test_response_body_limit(limit: int, size_delta: int) -> None:
+    """Accept bodies at the limit and reject even one additional byte."""
+    response = MagicMock()
+    body = b"x" * (limit + size_delta)
+    if size_delta <= 0:
+        response.content.readexactly = AsyncMock(
+            side_effect=asyncio.IncompleteReadError(body, limit + 1)
+        )
+        assert await DejavuAnalysisProvider._read_response(response, limit, "too large") == body
+    else:
+        response.content.readexactly = AsyncMock(return_value=body)
+        with pytest.raises(InvalidDataError, match="too large"):
+            await DejavuAnalysisProvider._read_response(response, limit, "too large")
+    response.content.readexactly.assert_awaited_once_with(limit + 1)
+
+
 @pytest.mark.parametrize("status", ["full", "partial", "unknown"])
 async def test_availability_before_sampler(status: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Only verified full coverage skips the sampler."""
