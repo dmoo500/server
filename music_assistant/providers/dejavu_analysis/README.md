@@ -19,6 +19,11 @@ Local results use the existing audio-analysis storage. Sharing is off by default
 
 Consent is recorded for the destination used when analysis starts. Enabling sharing later does not backfill old private results. Changing destinations does not redirect pending uploads. Analysis must complete through MA's normal finalization; cancellation never uploads.
 
+When the receiver advertises `release_hints_version: 1`, the provider adds any
+MusicBrainz release and release-group IDs already on the source album, without
+a new lookup. Existing analyses are not backfilled. Older receivers get the
+same upload as before.
+
 When sharing is enabled and the receiver advertises availability support, the provider checks existing local metadata before sampling. A verified full recording skips analysis and sharing; partial or unknown recordings proceed normally. Recovery checks eligible stored results in batches and skips already-full recordings without deleting them or marking them accepted. Remote errors are logged and do not block analysis; older receivers without this optional capability continue to work. Results are cached briefly per destination, credentials and identity. Sharing disabled never sends this metadata.
 
 Availability requests share the existing outbound pacing. If the receiver returns a rate limit or server error, preflight checks pause for the indicated retry period (at least five minutes) while normal analysis continues; this cooldown does not defer uploads.

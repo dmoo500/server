@@ -168,6 +168,9 @@ async def test_shared_metadata_uses_existing_queue_track_without_provider_fetch(
         provider_mappings=set(),
         external_ids={(ExternalID.ISRC, "USAAA2600001")},
     )
+    assert track.album is not None
+    track.album.add_external_id(ExternalID.MB_ALBUM, "f2148a15-2589-4aa3-8db5-528950f44d20")
+    track.album.add_external_id(ExternalID.MB_RELEASEGROUP, "e80e2732-0343-42af-92c7-da4bdf9c30d6")
     item = QueueItem.from_media_item("queue", track)
     item.streamdetails = stream
     provider.mass.player_queues.items.side_effect = lambda *_args: [item]
@@ -177,6 +180,10 @@ async def test_shared_metadata_uses_existing_queue_track_without_provider_fetch(
     assert metadata["artists"] == ["Queued artist"]
     assert metadata["album"] == "Queued album"
     assert metadata["isrc"] == "USAAA2600001"
+    assert provider._data["session"].release_hints == {
+        "release_mbid": "f2148a15-2589-4aa3-8db5-528950f44d20",
+        "release_group_mbid": "e80e2732-0343-42af-92c7-da4bdf9c30d6",
+    }
     provider.mass.music.get_item_by_uri.assert_not_called()
 
 
@@ -1029,6 +1036,35 @@ async def test_compact_upload_retains_legacy_identity() -> None:
     assert (
         provider.mass.http_session.post.call_args.kwargs["headers"]["Idempotency-Key"] == identifier
     )
+
+
+@pytest.mark.parametrize("version", [None, True, 1, 2])
+async def test_release_hints_require_explicit_receiver_support(version: Any) -> None:
+    """Only receivers advertising version 1 see hints in the canonical upload."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    hints = {"release_mbid": "f2148a15-2589-4aa3-8db5-528950f44d20"}
+    extra["release_hints"] = hints
+    capabilities: dict[str, Any] = {"api_version": 1, "fingerprint_encodings": [ENCODING_ID]}
+    if version is not None:
+        capabilities["release_hints_version"] = version
+    response = provider.mass.http_session.get.return_value.__aenter__.return_value
+    response.content.readexactly.side_effect = asyncio.IncompleteReadError(
+        json.dumps(capabilities).encode(), 4097
+    )
+    expected = decode_document(extra["dejavu"])
+    if type(version) is int and version == 1:
+        expected["metadata"] = {**expected["metadata"], **hints}
+    canonical = json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    identifier = hashlib.sha256(canonical.encode()).hexdigest()
+    _response(provider, 202, {"submission_id": identifier, "status": "queued"})
+    await provider._upload(extra)
+    request = provider.mass.http_session.post.call_args
+    assert decode_document(json.loads(request.kwargs["data"])) == expected
+    assert request.kwargs["headers"]["Idempotency-Key"] == identifier
+    assert "release_mbid" not in extra["dejavu"]["metadata"]
+    provider.mass.http_session.get.assert_called_once()
 
 
 @pytest.mark.parametrize(

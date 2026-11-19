@@ -68,6 +68,7 @@ class FingerprintSession:
     destination: str | None
     metadata: dict[str, Any]
     hashes: list[tuple[str, int]] = field(default_factory=list)
+    release_hints: dict[str, str] = field(default_factory=dict)
 
 
 async def setup(
@@ -95,6 +96,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         self._next_request_at = 0.0
         self._capability_destination: str | None = None
         self._availability_supported = False
+        self._release_hints_supported = False
         self._destination = self._configured_destination()
         if self._destination and not self.config.get_value(CONF_KEY):
             raise InvalidDataError("An API key is required when sharing fingerprints")
@@ -165,6 +167,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             self.logger.debug("Skipping fingerprint analysis without a finite duration")
             return False
         metadata: dict[str, Any] = {"duration": streamdetails.duration}
+        release_hints: dict[str, str] = {}
         destination = self._configured_destination()
         if destination:
             # Only existing library/queue metadata is consulted; this never fetches provider
@@ -172,6 +175,11 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             track = await self.mass.streams.audio_analysis.get_analysis_track(streamdetails)
             if track is not None:
                 metadata.update(self._track_metadata(track))
+                if track.album:
+                    if release := track.album.mbid:
+                        release_hints["release_mbid"] = release
+                    if group := track.album.get_external_id(ExternalID.MB_RELEASEGROUP):
+                        release_hints["release_group_mbid"] = group
             elif streamdetails.stream_metadata is not None:
                 metadata.update(
                     title=streamdetails.stream_metadata.title,
@@ -196,7 +204,9 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             )
         except ValueError as err:
             raise AudioAnalysisError(str(err)) from err
-        self._data[session_id] = FingerprintSession(sampler, destination, metadata)
+        self._data[session_id] = FingerprintSession(
+            sampler, destination, metadata, release_hints=release_hints
+        )
         return True
 
     async def _finalize(self, session_id: str) -> AudioAnalysisData | None:
@@ -229,9 +239,13 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         )
         if len(body.encode("utf-8")) > MAX_RESULT_BYTES:
             raise AudioAnalysisError("Fingerprint result exceeds the storage limit")
+        extra = {"dejavu": document, "upload_destination": data.destination}
+        if data.release_hints:
+            # Keep local hints outside the document so older plugins can still replay it.
+            extra["release_hints"] = data.release_hints
         return AudioAnalysisData(
             duration=data.metadata["duration"],
-            extra_data={"dejavu": document, "upload_destination": data.destination},
+            extra_data=extra,
         )
 
     @staticmethod
@@ -388,31 +402,32 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             ):
                 self.logger.error("Cannot upload an unsupported fingerprint envelope")
                 return
+            cache_key: str | None = None
+            retry_delay = RETRY_SECONDS
             try:
-                decoded = await self._run_offloaded(decode_document, document)
+                decoded = await self._upload_document(
+                    destination, document, extra.get("release_hints")
+                )
                 body = await self._run_offloaded(
                     json.dumps, decoded, sort_keys=True, separators=(",", ":"), allow_nan=False
                 )
-            except (ValueError, TypeError, UnicodeError) as err:
-                self.logger.error("Invalid stored fingerprint upload: %s", err)
-                return
-            if len(body.encode("utf-8")) > MAX_RESULT_BYTES:
-                self.logger.error("Stored fingerprint upload exceeds the size limit")
-                return
-            submission_id = hashlib.sha256(body.encode("utf-8")).hexdigest()
-            cache_key = hashlib.sha256(f"{destination}|{submission_id}".encode()).hexdigest()
-            status = await self.mass.cache.get(cache_key, provider=self.domain, allow_bypass=False)
-            if isinstance(status, dict):
-                if status.get("accepted") is True:
+                if len(body.encode("utf-8")) > MAX_RESULT_BYTES:
+                    self.logger.error("Stored fingerprint upload exceeds the size limit")
                     return
-                if status.get("retry_at", 0) > time.time():
-                    self._retry_at = status["retry_at"]
-                    self._schedule_retry()
+                submission_id = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                cache_key = hashlib.sha256(f"{destination}|{submission_id}".encode()).hexdigest()
+                status = await self.mass.cache.get(
+                    cache_key, provider=self.domain, allow_bypass=False
+                )
+                if isinstance(status, dict):
+                    if status.get("accepted") is True:
+                        return
+                    if status.get("retry_at", 0) > time.time():
+                        self._retry_at = status["retry_at"]
+                        self._schedule_retry()
+                        return
+                if self.unloading or self._configured_destination() != destination:
                     return
-            if self.unloading or self._configured_destination() != destination:
-                return
-            retry_delay = RETRY_SECONDS
-            try:
                 await self._check_capabilities(destination)
                 compact = await self._run_offloaded(encode_document, decoded)
                 compact_body = await self._run_offloaded(
@@ -429,7 +444,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 self._upload_blocked = True
                 self.logger.error("Fingerprint uploads stopped: %s", err)
                 return
-            except (ValueError, TypeError, UnicodeError) as err:
+            except (KeyError, ValueError, TypeError, UnicodeError) as err:
                 self.logger.error("Cannot encode stored fingerprint upload: %s", err)
                 return
             except (TimeoutError, aiohttp.ClientError) as err:
@@ -443,13 +458,34 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 )
                 return
             self._retry_at = time.time() + retry_delay
-            await self.mass.cache.set(
-                cache_key,
-                {"retry_at": self._retry_at},
-                provider=self.domain,
-                expiration=retry_delay,
-            )
+            if cache_key is not None:
+                await self.mass.cache.set(
+                    cache_key,
+                    {"retry_at": self._retry_at},
+                    provider=self.domain,
+                    expiration=retry_delay,
+                )
             self._schedule_retry()
+
+    async def _upload_document(
+        self, destination: str, document: dict[str, Any], hints: object
+    ) -> dict[str, Any]:
+        """Return the document supported by this receiver for hashing and delivery."""
+        decoded = await self._run_offloaded(decode_document, document)
+        if not isinstance(hints, dict) or not hints:
+            return decoded
+        await self._check_capabilities(destination)
+        if not self._release_hints_supported:
+            return decoded
+        metadata = dict(decoded["metadata"])
+        for key in ("release_mbid", "release_group_mbid"):
+            if isinstance(value := hints.get(key), str):
+                try:
+                    metadata[key] = str(UUID(value))
+                except ValueError:
+                    self.logger.warning("Ignoring invalid MusicBrainz upload hint %s", key)
+        decoded["metadata"] = metadata
+        return decoded
 
     async def _check_capabilities(self, destination: str) -> None:
         if self._capability_destination == destination:
@@ -490,6 +526,10 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         self._availability_supported = (
             type(capabilities.get("availability_version")) is int
             and capabilities["availability_version"] == 1
+        )
+        self._release_hints_supported = (
+            type(capabilities.get("release_hints_version")) is int
+            and capabilities["release_hints_version"] == 1
         )
 
     async def _availability(self, destination: str, metadata: list[dict[str, Any]]) -> list[str]:
