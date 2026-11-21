@@ -42,7 +42,7 @@ LONG_POLL_RETRY_DELAY = 5
 UNLOAD_TIMEOUT = 5
 
 # How long (seconds) to wait for a renderer's device description, which is read once per
-# room to get the hardware serial the player_id is derived from.
+# room to get the hardware serial the room's protocol id is derived from.
 DEVICE_INFO_TIMEOUT = 10
 
 # How long (seconds) a UPnP request to a speaker or the host may take.
@@ -92,8 +92,8 @@ GROUP_SETTLE_TIME = 10
 JOIN_SETTLE_TIME = 5
 JOIN_SETTLE_INTERVAL = 0.5
 
-# Player id prefix so ids are namespaced and stable-ish per room.
-PLAYER_ID_PREFIX = "raumfeld"
+# Protocol id prefix so ids are namespaced and stable-ish per room.
+PROTOCOL_ID_PREFIX = "raumfeld"
 
 # Media-server container listing each device's analog Line-In input, and the MA
 # source id used to expose a room's Line-In via PlayerFeature.SELECT_SOURCE.
@@ -109,12 +109,18 @@ LIBRARY_REFRESH_INTERVAL = 60
 # button gets a new object id, so this only bounds how long a renamed item keeps its old title.
 BUTTON_ITEM_CACHE_TTL = 300
 CACHE_CATEGORY_BUTTON_ITEMS = 1
-# The player id a room got, kept per room UDN. A room of several speakers takes its id from one
+# The protocol id a room got, kept per room UDN. A room of several speakers takes its id from one
 # speaker's serial, and the host lists a room's speakers in no fixed order; without it the room
-# would take another speaker's id - and so another player config - when a speaker joins it or
-# is away for a while.
+# would take another speaker's id - and so another protocol record and player - when a speaker
+# joins it or is away for a while.
 CACHE_CATEGORY_ROOM_ID = 3
 ROOM_ID_CACHE_TTL = 10 * 365 * 24 * 3600
+# The outputs taken off a room because their speaker moved to another room, with the UDN of
+# that speaker. An output taken off a player stays apart from it for the server, so it only
+# joins a room that plays through its speaker again because the provider merges it, also when
+# the speaker returns after a restart.
+CACHE_CATEGORY_RELEASED_OUTPUTS = 4
+RELEASED_OUTPUTS_KEY = "released_outputs"
 SOURCE_LINE_IN = "line_in"
 
 # A room joining a group that plays hooks into the running stream a little behind the others

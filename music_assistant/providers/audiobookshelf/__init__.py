@@ -415,6 +415,8 @@ for more details.
         # safe guard user updates
         self._pending_user_update: User | None = None
         self._user_update_task: asyncio.Task[None] | None = None
+        # catch up on progresses changed while mass was offline
+        await self._socket_abs_user_updated(abs_user)
 
         # create close sessions task
         self._close_sessions_task = self.mass.create_task(self._cleanup_open_sessions_loop())
@@ -1432,7 +1434,7 @@ for more details.
                 )
                 if mp is not None:
                     await self._client.remove_my_media_progress(media_progress_id=mp.id_)
-                    self.logger.debug(f"Removed media progress of {media_type.value}.")
+                    self.logger.debug("Removed media progress of %s.", media_type.value)
                 return
 
             duration = media_item.duration
@@ -1442,7 +1444,7 @@ for more details.
             # a session sync can't mark the item finished
             if not updated or fully_played:
                 self.logger.debug(
-                    f"Updating media progress of {media_type.value}, title {media_item.name}."
+                    "Updating media progress of %s, title %s.", media_type.value, media_item.name
                 )
                 await self._client.update_my_media_progress(
                     item_id=abs_podcast_id,
@@ -1470,7 +1472,7 @@ for more details.
                 mp = await self._client.get_my_media_progress(item_id=prov_item_id)
                 if mp is not None:
                     await self._client.remove_my_media_progress(media_progress_id=mp.id_)
-                    self.logger.debug(f"Removed media progress of {media_type.value}.")
+                    self.logger.debug("Removed media progress of %s.", media_type.value)
                 return
 
             duration = media_item.duration
@@ -1478,7 +1480,9 @@ for more details.
             if session_helper := self.sessions.get(prov_item_id):
                 updated = await _update_by_session(session_helper=session_helper, duration=duration)
             if not updated or fully_played:
-                self.logger.debug(f"Updating {media_type.value} named {media_item.name} progress")
+                self.logger.debug(
+                    "Updating %s named %s progress", media_type.value, media_item.name
+                )
                 await self._client.update_my_media_progress(
                     item_id=prov_item_id,
                     duration_seconds=duration,
@@ -1853,7 +1857,7 @@ for more details.
         if progress.library_item_id not in known_ids:
             return
 
-        self.logger.debug(f"Updated progress of item {progress.library_item_id} via socket.")
+        self.logger.debug("Updated progress of item %s via socket.", progress.library_item_id)
 
         if progress.episode_id is None:
             await self._update_playlog_book(progress)
@@ -2071,7 +2075,7 @@ for more details.
                 await self._update_playlog_book(progress)
             else:
                 await self._update_playlog_episode(progress)
-        self.logger.debug(f"Updated {__updated_items} from full playlog.")
+        self.logger.debug("Updated %s from full playlog.", __updated_items)
 
         # Get MA's known progresses of ABS.
         # In ABS the user may discard a progress, which removes the progress completely.
@@ -2118,7 +2122,9 @@ for more details.
             return
         if int(progress.current_time) == 0 and not progress.is_finished:
             await self.mass.music.mark_item_unplayed(
-                mass_audiobook, provider_instance_id=self.instance_id
+                mass_audiobook,
+                provider_instance_id=self.instance_id,
+                progress_timestamp=progress.last_update // 1000,
             )
         else:
             await self.mass.music.mark_item_played(
@@ -2127,6 +2133,7 @@ for more details.
                 seconds_played=int(progress.current_time),
                 user_initiated=False,
                 provider_instance_id=self.instance_id,
+                progress_timestamp=progress.last_update // 1000,
             )
 
     async def _update_playlog_episode(self, progress: MediaProgress) -> None:
@@ -2145,7 +2152,9 @@ for more details.
             return
         if int(progress.current_time) == 0 and not progress.is_finished:
             await self.mass.music.mark_item_unplayed(
-                mass_episode, provider_instance_id=self.instance_id
+                mass_episode,
+                provider_instance_id=self.instance_id,
+                progress_timestamp=progress.last_update // 1000,
             )
         else:
             await self.mass.music.mark_item_played(
@@ -2154,6 +2163,7 @@ for more details.
                 seconds_played=int(progress.current_time),
                 user_initiated=False,
                 provider_instance_id=self.instance_id,
+                progress_timestamp=progress.last_update // 1000,
             )
 
     # other abs clients report the progress of a playing episode every 15s

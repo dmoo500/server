@@ -17,6 +17,7 @@ from music_assistant_models.queue_item import QueueItem
 
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.player_queues.state import PlayerQueueData
+from music_assistant.models.player import Player
 from music_assistant.providers.sonos.cloud_queue import SonosCloudQueue, _requested_max
 from music_assistant.providers.sonos.const import PLAYBACK_STATE_MAP
 from music_assistant.providers.sonos.player import SonosPlayer, SonosQueueWindow
@@ -92,7 +93,8 @@ def _make_player(items: list[QueueItem], current_index: int = 0) -> tuple[SonosP
     player = SonosPlayer.__new__(SonosPlayer)
     player.mass = mass
     player.logger = logging.getLogger("test.sonos.cloud_queue")
-    player._player_id = "sonos_player"
+    player._protocol_id = "sonos_player"
+    player._player = None
     player.connected = True
     player.cloud_queue_id = QUEUE_ID
     player.cloud_queue_version = 1.0
@@ -226,7 +228,7 @@ async def test_window_items_are_addressed_by_queue_position() -> None:
     player, _ = _make_player(items)
     resolve = cast("AsyncMock", player.mass.streams.resolve_stream_url)
 
-    window = await player.build_cloud_queue_window("track5")
+    window = await player.build_cloud_queue_window("track5@0")
 
     assert [call.kwargs["queue_index"] for call in resolve.await_args_list] == list(range(4, 16))
     # the ids stay those of the items, which is what the speaker reports back
@@ -305,6 +307,78 @@ async def test_a_window_is_centred_on_the_position_the_speaker_plays() -> None:
         "track2",
         "track3",
     ]
+
+
+async def test_a_window_asked_around_a_lost_id_holds_it_at_the_playing_position() -> None:
+    """
+    Test a window asked around an id the queue lost serves the playing track under that id.
+
+    The speaker discards a window without the id it asked about, and stops at the end of
+    the window it holds.
+    """
+    items = [_make_queue_item(f"track{i}") for i in range(5)]
+    player, _ = _make_player(items, current_index=1)
+
+    window = await player.build_cloud_queue_window("gone@0")
+
+    assert window.wire_ids == ["track0@0", "gone@0", "track2@0", "track3@0", "track4@0"]
+    assert window.items[1].title == "track1"
+    assert player._window_item_ids[1] == "gone@0"
+
+
+async def test_a_window_asked_around_a_bound_id_holds_it_at_its_position() -> None:
+    """
+    Test a window asked around a fetched id keeps it at its position, whatever sits there now.
+
+    The tracks after the playing one were replaced before the speaker fetched position 1
+    under the id it cached there.
+    """
+    player = _make_player_on_real_queues(4, RepeatMode.OFF)
+    queue_data = player.mass.player_queues._queue_data[QUEUE_ID]
+    await player.build_cloud_queue_window("track0@0")
+    queue_data.items[1:] = [_make_queue_item(f"new{i}") for i in range(1, 4)]
+    player.on_queue_position_served(1, "new1")
+
+    window = await player.build_cloud_queue_window("track1@0")
+
+    assert [x.queue_item_id for x in window.items] == ["track0", "new1", "new2", "new3"]
+    assert window.wire_ids == ["track0@0", "track1@0", "new2@0", "new3@0"]
+    assert player._window_item_ids[1] == "track1@0"
+    assert player.served_item_id("track1@0") == "new1"
+
+
+async def test_a_report_on_the_asked_id_resolves_to_the_item_served_there() -> None:
+    """Test the speaker fetching the position it asked about binds the id it asked about."""
+    player = _make_player_on_real_queues(4, RepeatMode.OFF)
+    player.mass.player_queues._queue_data[QUEUE_ID].queue.current_index = 1
+    await player.build_cloud_queue_window("gone@0")
+
+    player.on_queue_position_served(1, "track1")
+
+    assert player.served_item_id("gone@0") == "track1"
+
+
+async def test_a_repeated_position_keeps_the_asked_id() -> None:
+    """Test a track repeating itself is listed again under the id the speaker asked about."""
+    player = _make_player_on_real_queues(3, RepeatMode.ONE)
+
+    window = await player.build_cloud_queue_window("gone@0")
+
+    assert window.wire_ids == ["gone@0", "gone@0"]
+    assert player._window_item_ids == {0: "gone@0"}
+
+
+async def test_a_window_asked_around_an_id_of_an_earlier_load_keeps_the_ids_of_this_load() -> None:
+    """Test an id from before the current load is not echoed: the speaker moves to the new load."""
+    items = [_make_queue_item(f"track{i}") for i in range(3)]
+    player, _ = _make_player(items, current_index=1)
+    player.cloud_queue_item_generation = 1
+
+    moved = await player.build_cloud_queue_window("track2@0")
+    lost = await player.build_cloud_queue_window("gone@0")
+
+    assert moved.wire_ids == ["track1@1", "track2@1"]
+    assert lost.wire_ids == ["track0@1", "track1@1", "track2@1"]
 
 
 async def test_unavailable_items_are_left_out() -> None:
@@ -400,7 +474,7 @@ async def test_stop_forgets_the_cloud_queue() -> None:
     client.player.is_passive = False
     client.player.group.stop = AsyncMock()
     player.client = client
-    player.mark_stop_called = MagicMock()  # type: ignore[misc, method-assign]
+    attached_to = player._player = MagicMock(spec=Player)
     player.update_state = MagicMock()  # type: ignore[misc, method-assign]
     player._announcement_media = PlayerMedia(
         uri="http://announcement", media_type=MediaType.ANNOUNCEMENT
@@ -408,6 +482,7 @@ async def test_stop_forgets_the_cloud_queue() -> None:
 
     await player.stop()
 
+    attached_to.mark_stop_called.assert_called_once_with()
     assert player.cloud_queue_id is None
     assert player._announcement_media is None
 
@@ -488,7 +563,7 @@ async def test_itemwindow_logs_the_speakers_request_at_debug(
 ) -> None:
     """Test a support case can read what the speaker asked for from one debug line."""
     player = MagicMock(spec=SonosPlayer)
-    player.player_id = "RINCON_TEST"
+    player.protocol_id = "RINCON_TEST"
     player.cloud_queue_version = 12.5
     player.cloud_queue_item_generation = 4
     player.bare_item_id = SonosPlayer.bare_item_id
@@ -528,7 +603,7 @@ async def test_itemwindow_logs_the_end_of_queue_fallback_at_debug(
 ) -> None:
     """Test the served window is logged even when the queue can no longer be described."""
     player = MagicMock(spec=SonosPlayer)
-    player.player_id = "RINCON_TEST"
+    player.protocol_id = "RINCON_TEST"
     player.cloud_queue_version = 1.0
     player.cloud_queue_item_generation = 1
     player.build_cloud_queue_window = AsyncMock(side_effect=InvalidDataError("no session"))
@@ -550,7 +625,7 @@ async def test_version_logs_the_speakers_poll_at_debug(
 ) -> None:
     """Test the version poll reports which version the speaker holds and which we serve."""
     player = MagicMock(spec=SonosPlayer)
-    player.player_id = "RINCON_TEST"
+    player.protocol_id = "RINCON_TEST"
     player.cloud_queue_version = 12.5
     cloud_queue = _make_cloud_queue()
     request = MagicMock()
@@ -621,7 +696,7 @@ async def test_a_track_repeating_itself_is_listed_once_more(
     """
     player = _make_player_on_real_queues(count, repeat_mode)
 
-    window = await player.build_cloud_queue_window("track0")
+    window = await player.build_cloud_queue_window("track0@0")
 
     assert [x.queue_item_id for x in window.items] == ["track0", "track0"]
     assert window.wire_ids == ["track0@0", "track0@0"]
@@ -646,7 +721,7 @@ async def test_a_short_queue_on_repeat_all_still_fills_the_window() -> None:
     """Test repeat all wraps round a short queue, so the speaker does not run dry early."""
     player = _make_player_on_real_queues(3, RepeatMode.ALL)
 
-    window = await player.build_cloud_queue_window("track0")
+    window = await player.build_cloud_queue_window("track0@0")
 
     assert [x.queue_item_id for x in window.items] == [f"track{i % 3}" for i in range(11)]
     assert window.wire_ids == [f"track{i % 3}@0" for i in range(11)]
@@ -934,12 +1009,12 @@ def test_queue_change_only_reaches_the_speakers_playing_it() -> None:
     provider.logger = logging.getLogger("test.sonos.cloud_queue")
     provider._pending_refresh_tasks = set()
     playing, other = MagicMock(spec=SonosPlayer), MagicMock(spec=SonosPlayer)
-    playing.player_id = "playing"
+    playing.protocol_id = "playing"
     playing.cloud_queue_id = QUEUE_ID
-    other.player_id = "other"
+    other.protocol_id = "other"
     other.cloud_queue_id = "another_queue"
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(type(provider), "players", property(lambda _self: [playing, other]))
+        patch.setattr(type(provider), "protocols", property(lambda _self: [playing, other]))
         provider._handle_queue_items_updated(MagicMock(object_id=QUEUE_ID))
 
     # the version must be invalidated before the (debounced) command goes out, or a window
@@ -1155,3 +1230,71 @@ async def test_a_load_after_a_wake_nudges_a_speaker_that_stays_paused(
 
     assert client.player.group.play.await_count == (1 if expect_nudge else 0)
     assert player._woken_from_sleep is False
+
+
+async def _read_window(player: SonosPlayer, item_id: str) -> None:
+    """Let the speaker read its cloud queue window around the given id, as it does over HTTP."""
+    request = MagicMock()
+    request.query = {"itemId": item_id, "previousWindowSize": "9", "upcomingWindowSize": "10"}
+    await _make_cloud_queue()._handle_sonos_queue_itemwindow(player, request)
+
+
+async def test_the_next_item_of_the_window_the_speaker_read_is_received() -> None:
+    """An item the speaker read in its window is one it holds, not one it fetches cold."""
+    items = [_make_queue_item(f"track{i}") for i in range(3)]
+    player, _ = _make_player(items)
+
+    assert not player.has_received_next_item(items[1])
+    await _read_window(player, "track0@0")
+
+    assert player.has_received_next_item(items[1])
+
+
+async def test_an_item_added_after_the_speaker_read_its_window_is_not_received() -> None:
+    """A track that extends the queue counts only once the speaker read a window holding it."""
+    player, queues = _make_player([_make_queue_item("track0")])
+    await _read_window(player, "track0@0")
+    # autoplay extends a one-track start: the speaker is told to refresh, but holds back
+    queues.items.append(_make_queue_item("track1"))
+
+    assert not player.has_received_next_item(queues.items[1])
+    await _read_window(player, "track0@0")
+    assert player.has_received_next_item(queues.items[1])
+
+
+async def test_an_item_the_window_holds_at_another_position_is_not_received() -> None:
+    """The speaker holds its window by position, so an item that moved since is not held."""
+    player, queues = _make_player([_make_queue_item(f"track{i}") for i in range(4)])
+    await _read_window(player, "track0@0")
+    queues.items.insert(1, _make_queue_item("guest"))
+
+    # the window named track1 where the guest is now, and track2 where track1 is now
+    assert not player.has_received_next_item(queues.items[1])
+    assert not player.has_received_next_item(queues.items[2])
+
+
+async def test_a_window_read_before_the_current_load_is_not_received() -> None:
+    """A load starts the speaker over: only a window it read since then counts."""
+    items = [_make_queue_item(f"track{i}") for i in range(3)]
+    player, _ = _make_player(items)
+    await _read_window(player, "track0@0")
+    client = MagicMock()
+    client.player.is_passive = False
+    _loads_into_a_session(client.player.group)
+    player.client = client
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(SonosPlayer, "flow_mode", property(lambda _self: False))
+        await player.play_media(
+            PlayerMedia(
+                uri="library://track/1",
+                media_type=MediaType.TRACK,
+                source_id=QUEUE_ID,
+                queue_item_id="track0",
+                queue_session_id="session-2",
+            )
+        )
+
+    assert not player.has_received_next_item(items[1])
+    await _read_window(player, player.wire_item_id("track0") or "")
+    assert player.has_received_next_item(items[1])
