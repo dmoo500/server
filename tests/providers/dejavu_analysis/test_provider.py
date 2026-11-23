@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 from email.utils import formatdate
@@ -384,8 +385,11 @@ async def test_response_body_limit(limit: int, size_delta: int) -> None:
 
 
 @pytest.mark.parametrize("status", ["full", "partial", "unknown"])
-async def test_availability_before_sampler(status: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_availability_before_sampler(
+    status: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     """Only verified full coverage skips the sampler."""
+    caplog.set_level(logging.DEBUG)
     provider = await _provider(upload=True, application_key="application")
     assert isinstance(provider.mass, MagicMock)
     destination = provider._configured_destination()
@@ -416,6 +420,9 @@ async def test_availability_before_sampler(status: str, monkeypatch: pytest.Monk
         status != "full"
     )
     assert sampler.call_count == (0 if status == "full" else 1)
+    message = "Skipping fingerprint analysis for Recovered title: already available on server"
+    assert (message in caplog.text) is (status == "full")
+    assert "private-provider.example" not in caplog.text
     request = provider.mass.http_session.post.call_args
     assert request.kwargs["headers"]["X-API-Key"] == "test-key"
     assert request.kwargs["headers"]["X-Application-Key"] == "application"

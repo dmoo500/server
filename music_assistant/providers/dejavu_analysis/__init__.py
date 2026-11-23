@@ -194,6 +194,10 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                     "hold this contribution pending metadata"
                 )
             if (await self._availability(destination, [metadata]))[0] == "full":
+                self.logger.debug(
+                    "Skipping fingerprint analysis for %s: already available on server",
+                    metadata.get("title") or "unknown track",
+                )
                 return False
         try:
             sampler = WindowSampler(
