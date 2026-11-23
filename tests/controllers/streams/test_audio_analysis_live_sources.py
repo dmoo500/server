@@ -155,6 +155,7 @@ async def controller(registry: dict[str, Any]) -> AsyncIterator[AudioAnalysisCon
     mass.get_provider = MagicMock(side_effect=lambda pid, **_kw: registry.get(pid))
     mass.get_providers = MagicMock(side_effect=lambda _type: list(registry.values()))
     mass.players = _Players()
+    mass.config.get_raw_core_config_value.return_value = False
     controller = AudioAnalysisController(streams)
     controller._database_ready = True
     mass.streams.audio_analysis = controller
@@ -674,6 +675,160 @@ async def test_reported_metadata_shows_on_a_live_source_until_its_plugin_reports
     provider.report_stream_metadata(session_key, StreamMetadata(title="Recognised later"))
 
     assert source_session.stream_metadata is owners
+
+
+@pytest.mark.asyncio
+async def test_live_recognized_artwork_reuses_metadata_lookup_and_preserves_timing(
+    controller: AudioAnalysisController, registry: dict[str, Any]
+) -> None:
+    """Enrich the latest report for a song without restarting its lookup."""
+    mass = cast("MagicMock", controller.mass)
+    mass.config.get_raw_core_config_value.return_value = True
+    gate = asyncio.Event()
+
+    async def lookup(**_kwargs: Any) -> tuple[str, None, None]:
+        await gate.wait()
+        return "https://example.test/cover.jpg", None, None
+
+    mass.metadata.get_image_url_by_name = AsyncMock(side_effect=lookup)
+    provider = _recognizer(controller, registry)
+    source = _source_session(controller)
+    session_key = await _start_source(controller, source)
+    first = StreamMetadata(title="Song", artist="Artist", album="Album", elapsed_time=20)
+    provider.report_stream_metadata(session_key, first)
+    latest = StreamMetadata(
+        title="Song",
+        artist="Artist",
+        album="Album",
+        duration=240,
+        elapsed_time=30,
+        elapsed_time_last_updated=1234,
+    )
+    provider.report_stream_metadata(session_key, latest)
+    gate.set()
+    await _until(lambda: source.stream_metadata is not None and source.stream_metadata.image_url)
+    assert source.stream_metadata is not None
+    assert source.stream_metadata.image_url == "https://example.test/cover.jpg"
+    assert source.stream_metadata.duration == 240
+    assert source.stream_metadata.elapsed_time == 30
+    assert source.stream_metadata.elapsed_time_last_updated == 1234
+    mass.metadata.get_image_url_by_name.assert_awaited_once_with(
+        artist_name="Artist", track_name="Song", album_name="Album"
+    )
+    provider.report_stream_metadata(session_key, latest)
+    assert source.stream_metadata is not None
+    assert source.stream_metadata.image_url == "https://example.test/cover.jpg"
+    await _stop_source(controller, session_key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["new_song", "source_metadata", "stop"])
+async def test_late_live_artwork_never_overwrites_current_metadata(
+    controller: AudioAnalysisController, registry: dict[str, Any], change: str
+) -> None:
+    """A cancelled, delayed artwork result must not replace a later report or source."""
+    mass = cast("MagicMock", controller.mass)
+    mass.config.get_raw_core_config_value.return_value = True
+    started = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def lookup(**_kwargs: Any) -> tuple[str, None, None]:
+        started.set()
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            await gate.wait()
+        return "https://example.test/old.jpg", None, None
+
+    mass.metadata.get_image_url_by_name = AsyncMock(side_effect=lookup)
+    provider = _recognizer(controller, registry)
+    source = _source_session(controller)
+    session_key = await _start_source(controller, source)
+    provider.report_stream_metadata(session_key, StreamMetadata(title="Old", artist="Artist"))
+    await started.wait()
+    task = controller._live_sources[session_key].artwork_task
+    assert task is not None
+    if change == "new_song":
+        replacement = StreamMetadata(title="New")
+        provider.report_stream_metadata(session_key, replacement)
+    elif change == "source_metadata":
+        replacement = StreamMetadata(title="Source")
+        _players(controller).update_source_metadata(
+            PLAYER_ID, source.source_id, SOURCE_PROVIDER_ID, replacement
+        )
+    else:
+        replacement = None
+        await _stop_source(controller, session_key)
+    gate.set()
+    await task
+    assert source.stream_metadata is replacement
+    if change != "stop":
+        await _stop_source(controller, session_key)
+
+
+@pytest.mark.asyncio
+async def test_old_artwork_result_does_not_apply_after_return_to_same_song(
+    controller: AudioAnalysisController, registry: dict[str, Any]
+) -> None:
+    """A result from an earlier occurrence of the same song remains stale."""
+    mass = cast("MagicMock", controller.mass)
+    mass.config.get_raw_core_config_value.return_value = True
+    old_gate = asyncio.Event()
+    new_gate = asyncio.Event()
+    calls = 0
+
+    async def lookup(**_kwargs: Any) -> tuple[str, None, None]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            try:
+                await old_gate.wait()
+            except asyncio.CancelledError:
+                await old_gate.wait()
+            return "https://example.test/old.jpg", None, None
+        await new_gate.wait()
+        return "https://example.test/new.jpg", None, None
+
+    mass.metadata.get_image_url_by_name = AsyncMock(side_effect=lookup)
+    provider = _recognizer(controller, registry)
+    source = _source_session(controller)
+    session_key = await _start_source(controller, source)
+    provider.report_stream_metadata(session_key, StreamMetadata(title="Song", artist="Artist"))
+    old_task = controller._live_sources[session_key].artwork_task
+    assert old_task is not None
+    provider.report_stream_metadata(session_key, StreamMetadata(title="Other"))
+    provider.report_stream_metadata(session_key, StreamMetadata(title="Song", artist="Artist"))
+    old_gate.set()
+    await old_task
+    assert source.stream_metadata is not None
+    assert [source.stream_metadata.image_url] == [None]
+    new_gate.set()
+    await _until(lambda: source.stream_metadata is not None and source.stream_metadata.image_url)
+    assert source.stream_metadata is not None
+    assert source.stream_metadata.image_url == "https://example.test/new.jpg"
+    await _stop_source(controller, session_key)
+
+
+@pytest.mark.asyncio
+async def test_live_artwork_lookup_respects_opt_out_and_supplied_image(
+    controller: AudioAnalysisController, registry: dict[str, Any]
+) -> None:
+    """Never look up a disabled or already supplied cover."""
+    mass = cast("MagicMock", controller.mass)
+    mass.config.get_raw_core_config_value.return_value = False
+    mass.metadata.get_image_url_by_name = AsyncMock()
+    provider = _recognizer(controller, registry)
+    source = _source_session(controller)
+    session_key = await _start_source(controller, source)
+    provider.report_stream_metadata(session_key, StreamMetadata(title="One", artist="Artist"))
+    mass.config.get_raw_core_config_value.return_value = True
+    provider.report_stream_metadata(
+        session_key,
+        StreamMetadata(title="Two", artist="Artist", image_url="https://example.test/a"),
+    )
+    await asyncio.sleep(0)
+    mass.metadata.get_image_url_by_name.assert_not_awaited()
+    await _stop_source(controller, session_key)
 
 
 @pytest.mark.parametrize("ending", ["stream_ends", "provider_unloads"])

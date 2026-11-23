@@ -1,0 +1,23 @@
+{
+  "config_entries": {
+    "server_url": {
+      "label": "Fingerprint server URL",
+      "description": "HTTPS address of the fingerprint server. HTTP is allowed only for localhost."
+    },
+    "api_key": {
+      "label": "Recognition API key",
+      "description": "A key with read access to the fingerprint server."
+    },
+    "application_key": {
+      "label": "Application key",
+      "description": "Required when the fingerprint server uses the APISIX gateway."
+    },
+    "sources": {
+      "label": "Live inputs to recognize",
+      "description": "Only selected live inputs that allow audio analysis are recognized. Audio stays in memory; fingerprints are sent to the configured server."
+    }
+  },
+  "manifest": {
+    "description": "Recognizes music from selected live inputs using a fingerprint server."
+  }
+}

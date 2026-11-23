@@ -1,0 +1,13 @@
+{
+  "type": "audio_analysis",
+  "domain": "dejavu_fingerprint_recognize",
+  "stage": "alpha",
+  "name": "Dejavu Fingerprint Recognizer",
+  "description": "Recognizes music from selected live inputs using a fingerprint server.",
+  "codeowners": ["@dmoo500"],
+  "requirements": ["audio-fingerprint @ git+https://github.com/dmoo500/audio-fingerprint.git@4f8b5d7b98554d14e8cc66a64c49305dbce408c2"],
+  "documentation": "https://github.com/dmoo500/audio-fingerprint-server",
+  "multi_instance": false,
+  "builtin": false,
+  "icon": "fingerprint"
+}

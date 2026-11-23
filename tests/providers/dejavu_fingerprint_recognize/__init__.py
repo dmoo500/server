@@ -1,0 +1,1 @@
+"""Fingerprint recognizer tests."""

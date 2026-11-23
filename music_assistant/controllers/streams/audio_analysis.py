@@ -37,6 +37,7 @@ from music_assistant.constants import (
     LOUDNESS_MEASUREMENT_MIN_LUFS,
     MASS_LOGGER_NAME,
 )
+from music_assistant.controllers.metadata.constants import CONF_ENABLE_RADIO_METADATA_LOOKUP
 from music_assistant.controllers.streams.audio_analysis_codec import (
     decode,
     decode_extra_data,
@@ -276,6 +277,9 @@ class _LiveSourceAnalysis:
     # the metadata a provider reported that the source shows, and that provider
     reported: StreamMetadata | None = None
     reported_by: AudioAnalysisProvider | None = None
+    artwork_key: tuple[str, str, str | None] | None = None
+    artwork_generation: int = 0
+    artwork_task: asyncio.Task[None] | None = None
 
 
 @dataclasses.dataclass
@@ -618,6 +622,20 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
         if not self._takes_part(session_key, provider):
             return False
         if (live := self._live_sources.get(session_key)) is not None:
+            key = (
+                (stream_metadata.artist, stream_metadata.title, stream_metadata.album)
+                if stream_metadata.artist and stream_metadata.title
+                else None
+            )
+            if (
+                key == live.artwork_key
+                and live.reported is not None
+                and live.reported.image_url
+                and not stream_metadata.image_url
+            ):
+                stream_metadata = dataclasses.replace(
+                    stream_metadata, image_url=live.reported.image_url
+                )
             if not self.mass.players.show_analysis_metadata(
                 live.source_session,
                 live.playback_session_id,
@@ -627,6 +645,23 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
                 return False
             live.reported = stream_metadata
             live.reported_by = provider
+            if key != live.artwork_key:
+                if live.artwork_task is not None:
+                    live.artwork_task.cancel()
+                live.artwork_key = key
+                live.artwork_generation += 1
+                live.artwork_task = None
+            if (
+                key is not None
+                and live.artwork_task is None
+                and not stream_metadata.image_url
+                and self.mass.config.get_raw_core_config_value(
+                    self.mass.metadata.domain, CONF_ENABLE_RADIO_METADATA_LOOKUP, True
+                )
+            ):
+                live.artwork_task = self.mass.create_task(
+                    self._enrich_live_artwork(session_key, live, key, live.artwork_generation)
+                )
             return True
         radio = next(
             (radio for radio in self._radio_analyses.values() if radio.session_key == session_key),
@@ -2298,10 +2333,44 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
 
     def _withdraw_source_metadata(self, live: _LiveSourceAnalysis) -> None:
         """Withdraw what the analysis of a live source reported, if the source still shows it."""
+        if live.artwork_task is not None:
+            live.artwork_task.cancel()
+            live.artwork_task = None
+        live.artwork_key = None
         if live.reported is None:
             return
         self.mass.players.withdraw_analysis_metadata(live.source_session, live.reported)
         live.reported = live.reported_by = None
+
+    async def _enrich_live_artwork(
+        self,
+        session_key: str,
+        live: _LiveSourceAnalysis,
+        key: tuple[str, str, str | None],
+        generation: int,
+    ) -> None:
+        image, _, _ = await self.mass.metadata.get_image_url_by_name(
+            artist_name=key[0], track_name=key[1], album_name=key[2]
+        )
+        if (
+            not image
+            or self._live_sources.get(session_key) is not live
+            or live.artwork_key != key
+            or live.artwork_generation != generation
+            or live.reported is None
+            or live.reported.image_url
+            or live.reported_by is None
+            or not self._takes_part(session_key, live.reported_by)
+            or not self.mass.config.get_raw_core_config_value(
+                self.mass.metadata.domain, CONF_ENABLE_RADIO_METADATA_LOOKUP, True
+            )
+        ):
+            return
+        enriched = dataclasses.replace(live.reported, image_url=image)
+        if self.mass.players.show_analysis_metadata(
+            live.source_session, live.playback_session_id, live.stream_session_id, enriched
+        ):
+            live.reported = enriched
 
     def _cpu_count(self) -> int:
         """Return the CPU core count available to this process (fallback 4 when unknown)."""
