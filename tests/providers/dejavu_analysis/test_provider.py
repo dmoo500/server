@@ -458,13 +458,13 @@ async def test_availability_failure_continues_analysis(
 
 
 @pytest.mark.parametrize(("http_status", "date_header"), [(429, False), (503, True)])
-async def test_availability_pacing_and_cooldown_allow_distinct_tracks(
+async def test_availability_cooldown_defers_uploads_but_not_analysis(
     http_status: int,
     date_header: bool,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rate limits pause preflights, not PCM analysis or normal uploads."""
+    """Rate limits pause requests but not PCM analysis, and defer pending uploads."""
     provider = await _provider(upload=True)
     assert isinstance(provider.mass, MagicMock)
     provider._capability_destination = provider._configured_destination()
@@ -482,23 +482,26 @@ async def test_availability_pacing_and_cooldown_allow_distinct_tracks(
     monkeypatch.setattr(provider, "_pace_request", pace)
     stream = _stream()
     assert await provider.start_analysis("first", stream, stream.audio_format)
-    assert 3598 <= provider._availability_retry_at - time.monotonic() <= 3600
-    assert provider._retry_at == 0
+    assert 3598 <= provider._retry_at - time.time() <= 3600
+    await provider._upload(
+        {"upload_destination": provider._configured_destination()}, availability_checked=True
+    )
+    assert provider.mass.call_later.called
     assert await provider.start_analysis("second", stream, stream.audio_format)
     assert provider.mass.http_session.post.call_count == 1
     pace.assert_awaited_once()
     assert "availability check failed" in caplog.text
-    provider._availability_retry_at = 0
+    provider._retry_at = 0
     assert await provider.start_analysis("third", stream, stream.audio_format)
     assert provider.mass.http_session.post.call_count == 2
     assert pace.await_count == 2
 
 
-async def test_retry_after_minimum_invalid_and_ceiling(caplog: pytest.LogCaptureFixture) -> None:
-    """Retry headers retain the existing safe limits and invalid-value logging."""
+async def test_retry_after_minimum_invalid_and_long_delay(caplog: pytest.LogCaptureFixture) -> None:
+    """Respect long retry headers and log invalid values."""
     provider = await _provider(upload=True)
     assert provider._retry_delay({"Retry-After": "1"}) == 300
-    assert provider._retry_delay({"Retry-After": "999999"}) == 86400
+    assert provider._retry_delay({"Retry-After": "999999"}) == 999999
     assert provider._retry_delay({"Retry-After": "invalid"}) == 300
     assert "invalid Retry-After" in caplog.text
 
@@ -792,6 +795,61 @@ async def test_rate_limit_defers_all_submissions() -> None:
     provider.mass.http_session.post.assert_called_once()
     assert provider.mass.cache.set.call_args.kwargs["expiration"] == 3600
     assert provider.mass.call_later.call_args.args[0] > 3500
+
+
+@pytest.mark.parametrize("http_status", [429, 503])
+async def test_upload_cooldown_also_defers_availability(http_status: int) -> None:
+    """An upload rejection prevents another request through the availability path."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    extra = await _envelope(provider)
+    provider._capability_destination = provider._configured_destination()
+    provider._availability_supported = True
+    _response(provider, http_status, {})
+    response = provider.mass.http_session.post.return_value.__aenter__.return_value
+    response.headers = {"Retry-After": "3600"}
+    await provider._upload(extra, availability_checked=True)
+    destination = provider._configured_destination()
+    assert destination is not None
+    assert await provider._availability(
+        destination, [provider._track_metadata(_repair_track())]
+    ) == ["unknown"]
+    provider.mass.http_session.post.assert_called_once()
+
+
+async def test_concurrent_upload_waits_for_availability_cooldown() -> None:
+    """A queued upload cannot race an availability response's retry deadline."""
+    provider = await _provider(upload=True)
+    assert isinstance(provider.mass, MagicMock)
+    destination = provider._configured_destination()
+    assert destination is not None
+    provider._capability_destination = destination
+    provider._availability_supported = True
+    _response(provider, 429, {})
+    context = provider.mass.http_session.post.return_value
+    response: MagicMock = context.__aenter__.return_value
+    response.headers = {"Retry-After": "3600"}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def enter() -> MagicMock:
+        started.set()
+        await release.wait()
+        return response
+
+    context.__aenter__.side_effect = enter
+    availability = asyncio.create_task(
+        provider._availability(destination, [provider._track_metadata(_repair_track())])
+    )
+    await started.wait()
+    upload = asyncio.create_task(
+        provider._upload({"upload_destination": destination}, availability_checked=True)
+    )
+    release.set()
+    assert await availability == ["unknown"]
+    await upload
+    provider.mass.http_session.post.assert_called_once()
+    provider.mass.call_later.assert_called()
 
 
 async def test_upload_can_be_revoked_before_request() -> None:

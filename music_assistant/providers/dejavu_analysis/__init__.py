@@ -92,7 +92,6 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         self._recovery_timer: asyncio.TimerHandle | None = None
         self._upload_blocked = False
         self._retry_at = 0.0
-        self._availability_retry_at = 0.0
         self._next_request_at = 0.0
         self._capability_destination: str | None = None
         self._availability_supported = False
@@ -394,10 +393,12 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             if (
                 self.unloading
                 or self._upload_blocked
-                or self._retry_at > time.time()
                 or destination is None
                 or extra.get("upload_destination") != destination
             ):
+                return
+            if self._retry_at > time.time():
+                self._schedule_retry()
                 return
             document = extra.get("dejavu")
             if not isinstance(document, dict) or document.get("format_id") not in (
@@ -505,7 +506,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             allow_redirects=False,
         ) as response:
             if response.status == 429 or response.status >= 500:
-                raise UploadDeferred(response.status, self._retry_delay(response.headers))
+                raise self._defer_requests(response.status, response.headers)
             if response.status != 200:
                 raise InvalidDataError(
                     f"Fingerprint capability check returned HTTP {response.status}; "
@@ -552,7 +553,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             return results
         try:
             async with self._upload_lock:
-                if self._availability_retry_at > time.monotonic():
+                if self._retry_at > time.time():
                     return results
                 headers = await self._upload_headers()
                 credential = hashlib.sha256(
@@ -618,7 +619,6 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
                 ):
                     return ["unknown"] * len(metadata)
         except UploadDeferred as err:
-            self._availability_retry_at = time.monotonic() + err.retry_seconds
             self.logger.warning("Fingerprint availability check failed: HTTP %s", err.status)
             return ["unknown"] * len(metadata)
         except (
@@ -706,7 +706,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             allow_redirects=False,
         ) as response:
             if response.status == 429 or response.status >= 500:
-                raise UploadDeferred(response.status, self._retry_delay(response.headers))
+                raise self._defer_requests(response.status, response.headers)
             if response.status != 200:
                 raise InvalidDataError(f"HTTP {response.status}")
             raw = await self._read_response(
@@ -764,13 +764,18 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
         value = headers.get("Retry-After", "")
         try:
             if value.isdigit():
-                return max(RETRY_SECONDS, min(int(value), 86400))
+                return max(RETRY_SECONDS, int(value))
             if value:
                 seconds = parsedate_to_datetime(value).timestamp() - time.time()
-                return max(RETRY_SECONDS, min(math.ceil(seconds), 86400))
+                return max(RETRY_SECONDS, math.ceil(seconds))
         except ValueError, TypeError, OverflowError:
             self.logger.warning("Fingerprint server returned invalid Retry-After")
         return RETRY_SECONDS
+
+    def _defer_requests(self, status: int, headers: Any) -> UploadDeferred:
+        retry = self._retry_delay(headers)
+        self._retry_at = max(self._retry_at, time.time() + retry)
+        return UploadDeferred(status, retry)
 
     async def _upload_headers(self) -> dict[str, str]:
         application_key = self.config.get_value(CONF_APPLICATION_KEY)
@@ -884,7 +889,7 @@ class DejavuAnalysisProvider(AudioAnalysisProvider):
             allow_redirects=False,
         ) as response:
             if response.status == 429 or response.status >= 500:
-                raise UploadDeferred(response.status, self._retry_delay(response.headers))
+                raise self._defer_requests(response.status, response.headers)
             if response.status not in (200, 202):
                 raise InvalidDataError(
                     f"HTTP {response.status}; check recognition server, API key and application token"
