@@ -195,6 +195,61 @@ async def test_next_capture_uses_audio_elapsed_during_server_request(
         await server.close()
 
 
+async def test_competing_session_retries_without_consuming_its_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session skipped by the shared request deadline remains ready to retry."""
+    calls = 0
+
+    async def recognize(_request: web.Request) -> web.Response:
+        nonlocal calls
+        calls += 1
+        return web.json_response({"status": "no_match", "match": None})
+
+    app = web.Application()
+    app.router.add_post("/api/v1/dejavu/recognize/landmarks", recognize)
+    server = TestServer(app)
+    await server.start_server()
+    provider = _provider(f"http://127.0.0.1:{server.port}")
+    fmt = AudioFormat(content_type=ContentType.PCM_S16LE, sample_rate=44100, channels=1)
+    second = b"\0" * (44100 * 2)
+    try:
+        async with aiohttp.ClientSession() as client:
+            cast("MagicMock", provider.mass).http_session = client
+            monkeypatch.setattr(
+                provider,
+                "_run_offloaded",
+                AsyncMock(return_value={"sample_count": 132300, "fingerprints": [("a" * 20, 0)]}),
+            )
+            monkeypatch.setattr(provider, "report_stream_metadata", MagicMock(return_value=True))
+            await provider.handle_async_init()
+            assert await provider._start_analysis("first", _stream(), fmt)
+            assert await provider._start_analysis("second", _stream(), fmt)
+            session = provider._live["second"]
+            session.last_capture = len(second)
+            session.elapsed_bytes = len(second) * 61
+            session.interval = 60
+            async with provider._request_lock:
+                for name in ("first", "second"):
+                    for _ in range(3):
+                        await provider.process_pcm_chunk(name, second)
+                await asyncio.sleep(0)
+            assert provider._live["first"].task is not None
+            assert session.task is not None
+            await asyncio.gather(provider._live["first"].task, session.task)
+            assert calls == 1
+            assert session.last_capture == len(second)
+            provider._next_request = 0
+            await provider.process_pcm_chunk("second", second)
+            assert session.task is not None
+            await session.task
+            assert calls == 2
+            await provider.cancel("first")
+            await provider.cancel("second")
+    finally:
+        await server.close()
+
+
 async def test_source_options_include_sendspin_style_player_provider() -> None:
     """Offer sources from any provider with the live source capability."""
     provider = _provider("http://127.0.0.1")

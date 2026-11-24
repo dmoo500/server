@@ -201,10 +201,15 @@ class FingerprintRecognizer(AudioAnalysisProvider):
             return
         if time.monotonic() < self._next_request:
             return
+        previous_capture = session.last_capture
         session.last_capture = session.elapsed_bytes
         session.task = self.mass.create_task(
             self._recognize(
-                session_id, session, bytes(session.buffer[-capture_bytes:]), time.time()
+                session_id,
+                session,
+                bytes(session.buffer[-capture_bytes:]),
+                time.time(),
+                previous_capture,
             )
         )
 
@@ -261,7 +266,12 @@ class FingerprintRecognizer(AudioAnalysisProvider):
             await asyncio.gather(session.task, return_exceptions=True)
 
     async def _recognize(
-        self, session_id: str, session: LiveSession, pcm: bytes, captured_at: float
+        self,
+        session_id: str,
+        session: LiveSession,
+        pcm: bytes,
+        captured_at: float,
+        previous_capture: int,
     ) -> None:
         try:
             payload = await self._run_offloaded(
@@ -275,7 +285,10 @@ class FingerprintRecognizer(AudioAnalysisProvider):
                 session.interval = MATCH_INTERVAL
                 return
             async with self._request_lock:
-                if self._disabled or time.monotonic() < self._next_request:
+                if self._disabled:
+                    return
+                if time.monotonic() < self._next_request:
+                    session.last_capture = previous_capture
                     return
                 self._next_request = time.monotonic() + 2.1
                 async with self.mass.http_session.post(
